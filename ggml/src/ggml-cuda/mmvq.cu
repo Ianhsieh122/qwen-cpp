@@ -132,8 +132,16 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA3_5,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_VOLTA
 };
+
+// Rows per thread on the Volta decode path: the V100 needs more bytes in flight per
+// thread than the 2 rows of K-loop work a single row provides, so decode walks several
+// output rows at once and lets the loads interleave.
+#ifndef BEE_MMVQ_VOLTA_ROWS
+#define BEE_MMVQ_VOLTA_ROWS 2
+#endif
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
@@ -146,7 +154,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
-#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_TURING
+    return MMVQ_PARAMETERS_VOLTA;
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
 #elif __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
@@ -171,7 +181,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
     }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_TURING) {
+        return MMVQ_PARAMETERS_VOLTA;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
@@ -422,15 +435,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
         switch (type) {
             case GGML_TYPE_Q2_K:
-                return ne11 <= 4;
             case GGML_TYPE_Q3_K:
-                return ne11 <= 6;
             case GGML_TYPE_Q4_K:
-                return ne11 <= 5;
             case GGML_TYPE_Q5_K:
-                return ne11 <= 6;
             case GGML_TYPE_Q6_K:
-                return ne11 <= 7;
+                return ne11 <= 1;
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
@@ -599,7 +608,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return 1;
     }
-    if (table_id == MMVQ_PARAMETERS_TURING) {
+    if (table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_VOLTA) {
         if (ncols_dst == 1) {
             switch (type) {
                 case GGML_TYPE_Q2_K:
@@ -653,6 +662,14 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_VOLTA) {
+        switch (ncols_dst) {
+            case 1:
+                return small_k ? nwarps : BEE_MMVQ_VOLTA_ROWS;
+            default:
+                return 2;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:

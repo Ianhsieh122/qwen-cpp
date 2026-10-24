@@ -914,10 +914,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+        // For Qwen3.8-27B Gated Attention (DKQ=256, DV=256, GQA=6:1 -> 6 query heads per KV head):
+        // Account for the full 6-head GQA batching on Volta so single-token decode (Q->ne[1] == 1)
+        // uses the vector kernel while MTP speculative verification (Q->ne[1] >= 4, 4*6 = 24 cols)
+        // and prefill route directly into the tuned Volta m8n8k4 Tensor Core MMA_F16 kernel (Q8_KV_TILE_SIZE = 8).
+        // GGML_UNUSED(volta_gqa_batch);
+        if (can_use_vector_kernel && Q->ne[1] == 1 && gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
-        if (Q->ne[1] * gqa_ratio_eff <= 16) {
+        if (Q->ne[1] * gqa_ratio_eff < 32) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }
         return BEST_FATTN_KERNEL_MMA_F16;

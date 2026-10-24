@@ -910,6 +910,37 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(VOLTA_MMA_AVAILABLE)
+// Volta sm_70 in-register 4-bit nibble -> FP16 half2 unpacker using prmt.b32 + lop3.b32
+// Unpacks 4 nibbles (at bit shift 0 or 4) from a 32-bit word into 2 half2 registers in {0.0h .. 15.0h} scaled by sc.
+static __device__ __forceinline__ void ggml_cuda_volta_unpack_q4_4_scaled(
+        const int v, const int shift, const half2 sc_h2, const half2 neg_1024_sc_h2, half2 & out0, half2 & out1) {
+    const uint32_t q = (uint32_t)(v >> shift);
+    const uint32_t magic = 0x64006400u; // IEEE-754 FP16 half2(1024.0f, 1024.0f)
+    uint32_t p0 = __byte_perm(q, magic, 0x7170);
+    uint32_t p1 = __byte_perm(q, magic, 0x7372);
+    asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p0));
+    asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p1));
+    const half2 neg_1024 = __float2half2_rn(-1024.0f);
+    // Exact integer nibble in {0.0h .. 15.0h}, then exact integer product nibble * sc in {0.0h .. 945.0h}
+    out0 = __hmul2(__hadd2(reinterpret_cast<const half2 &>(p0), neg_1024), sc_h2);
+    out1 = __hmul2(__hadd2(reinterpret_cast<const half2 &>(p1), neg_1024), sc_h2);
+    GGML_UNUSED(neg_1024_sc_h2);
+}
+
+// Volta sm_70 in-register int8 -> FP16 half2 unpacker using prmt.b32 + XOR sign flip
+static __device__ __forceinline__ void ggml_cuda_volta_unpack_q8_4(
+        const int u, half2 & out0, half2 & out1) {
+    const uint32_t x = (uint32_t)u ^ 0x80808080u;
+    const uint32_t magic = 0x64006400u; // 1024.0h
+    const uint32_t p0 = __byte_perm(x, magic, 0x7170);
+    const uint32_t p1 = __byte_perm(x, magic, 0x7372);
+    const half2 neg_1152 = __float2half2_rn(-1152.0f); // -(1024 + 128)
+    out0 = __hadd2(reinterpret_cast<const half2 &>(p0), neg_1152);
+    out1 = __hadd2(reinterpret_cast<const half2 &>(p1), neg_1152);
+}
+#endif // defined(VOLTA_MMA_AVAILABLE)
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -923,6 +954,105 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
+#if defined(VOLTA_MMA_AVAILABLE)
+    // Volta sm_70 Tensor Core (mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32) Q4_K x Q8_1 kernel:
+    // Each warp (threadIdx.y in 0..7) owns 16 rows: i_base = threadIdx.y * 16.
+    // Within a 32-thread warp, the 4 hardware m8n8k4 quadpairs (qp = (threadIdx.x % 16) / 4) are split:
+    //   - qp_row = qp & 1 (0: rows 0..7, 1: rows 8..15)
+    //   - qp_k   = qp >> 1 (0: first 16 K-elements of 32-element sub-block, 1: second 16 K-elements)
+    // This keeps 100% of Volta's 4 quadpair Tensor Cores active for every J (8, 16, 24, 32, ...).
+    const int i_base  = threadIdx.y * 16;
+    const int qp      = (threadIdx.x % 16) / 4;
+    const int qp_row  = qp & 1;
+    const int qp_k    = qp >> 1;
+    const int half_w  = threadIdx.x / 16;
+    const int tid_qp  = threadIdx.x % 4;
+
+    // Row index in tile_x loaded by this thread for matrix A (m8n8k4 row-major):
+    const int i_a = i_base + qp_row * 8 + half_w * 4 + tid_qp;
+    // Column offset within an 8-column block j0 loaded by this thread for matrix B (m8n8k4 col-major):
+    const int c_b = half_w * 4 + tid_qp;
+
+    const float2 dm_a = __half22float2(x_dm[i_a]);
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += 8) {
+        const int j_b = j0 + c_b;
+
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_K*VDR_Q4_K_Q8_1_MMQ) {
+            const int k0 = k00 + k01;
+            const uint8_t * sc_a = (const uint8_t *) &x_sc[i_a * (MMQ_TILE_NE_K/8) + i_a/8 + k0/32] + 2*(k01/16);
+            const int * v_a = &x_qs[i_a * (MMQ_TILE_NE_K + 1) + k0/2];
+
+            float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+#pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                const int shift = 4 * sub;
+                const half2 sc_h2 = __float2half2_rn((float)sc_a[sub]);
+                const half2 dummy = make_half2(0.0f, 0.0f);
+
+                // Each sub-block has 32 elements = 8 ints.
+                // qp_k == 0 processes ints 0..3 (16 elements = 4 m8n8k4 steps of k=4);
+                // qp_k == 1 processes ints 4..7 (16 elements = 4 m8n8k4 steps of k=4).
+                const int k_int_base = qp_k * 4;
+                const int * u_b = &y_qs[j_b * MMQ_TILE_Y_K + k01 + 8 * sub + k_int_base];
+
+                float c_sub[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    half2 a0, a1, b0, b1;
+                    ggml_cuda_volta_unpack_q4_4_scaled(v_a[k_int_base + s], shift, sc_h2, dummy, a0, a1);
+                    ggml_cuda_volta_unpack_q8_4(u_b[s], b0, b1);
+
+                    const int & a0_i = reinterpret_cast<const int &>(a0);
+                    const int & a1_i = reinterpret_cast<const int &>(a1);
+                    const int & b0_i = reinterpret_cast<const int &>(b0);
+                    const int & b1_i = reinterpret_cast<const int &>(b1);
+
+                    asm("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                        "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
+                        "{%0, %1, %2, %3, %4, %5, %6, %7};"
+                        : "+f"(c_sub[0]), "+f"(c_sub[1]), "+f"(c_sub[2]), "+f"(c_sub[3]),
+                          "+f"(c_sub[4]), "+f"(c_sub[5]), "+f"(c_sub[6]), "+f"(c_sub[7])
+                        : "r"(a0_i), "r"(a1_i), "r"(b0_i), "r"(b1_i));
+                }
+
+                // Scale each column c_d(l) = (tid_qp & 2) + (l & 5) by d_B(j0 + c_d, sub):
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int c_d = (tid_qp & 2) + (l & 5);
+                    const float d_b = __low2float(y_ds[(j0 + c_d) * MMQ_TILE_Y_K + k01/QI8_1 + sub]);
+                    acc[l] += c_sub[l] * d_b;
+                }
+            }
+
+            // Reduce across qp_k = 0 and qp_k = 1 (partner lane = threadIdx.x ^ 8):
+            // Threads with qp_k == 0 keep columns 0..3 (l = 0..3);
+            // Threads with qp_k == 1 keep columns 4..7 (l = 4..7).
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const float mine  = (qp_k == 0) ? acc[l]     : acc[l + 4];
+                const float other = (qp_k == 0) ? acc[l + 4] : acc[l];
+                const float recv  = __shfl_xor_sync(0xFFFFFFFF, other, 8, 32);
+                const float dot_sum = mine + recv;
+
+                const int i_out = i_base + qp_row * 8 + half_w * 4 + (l & 2) + (tid_qp & 1);
+                const int j_out = j0 + qp_k * 4 + (tid_qp & 2) + (l & 1);
+
+                const float2 dm_out = __half22float2(x_dm[i_out]);
+                const uint8_t * sc_out = (const uint8_t *) &x_sc[i_out * (MMQ_TILE_NE_K/8) + i_out/8 + k0/32] + 2*(k01/16);
+                const half2 ds0 = y_ds[j_out * MMQ_TILE_Y_K + k01/QI8_1 + 0];
+                const half2 ds1 = y_ds[j_out * MMQ_TILE_Y_K + k01/QI8_1 + 1];
+                const float min_term = dm_out.y * (sc_out[8] * __high2float(ds0) + sc_out[9] * __high2float(ds1));
+
+                sum[(j0 / 8) * 4 + l] += dm_out.x * dot_sum - min_term;
+            }
+        }
+    }
+    GGML_UNUSED(dm_a);
+#else
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_K*VDR_Q4_K_Q8_1_MMQ) {
         const int k0 = k00 + k01;
@@ -943,6 +1073,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
+#endif // defined(VOLTA_MMA_AVAILABLE)
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a(

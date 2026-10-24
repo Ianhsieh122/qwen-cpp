@@ -1111,6 +1111,26 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     const int     iqs = i0 % QK8_0;
 
     static_assert(ne % 2 == 0, "bad ne");
+
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    if constexpr (std::is_same<T, half>::value && ne == 4) {
+        // Volta/post-Volta fast in-register int8 -> half2 dequantization using prmt.b32 (__byte_perm)
+        // and XOR sign-bit flip with IEEE-754 FP16 magic constant 0x64006400u (1024.0h).
+        uint32_t q4 = 0;
+        ggml_cuda_memcpy_1<4, 2>(&q4, x[ib].qs + iqs);
+        const uint32_t x_u = q4 ^ 0x80808080u;
+        const uint32_t magic = 0x64006400u;
+        const uint32_t p0 = __byte_perm(x_u, magic, 0x7170);
+        const uint32_t p1 = __byte_perm(x_u, magic, 0x7372);
+        const half2 d = __half2half2(x[ib].d);
+        const half2 neg_1152 = __float2half2_rn(-1152.0f);
+        const half2 neg_1152_d = __hmul2(neg_1152, d);
+        ((half2 *) dst)[0] = __hfma2(reinterpret_cast<const half2 &>(p0), d, neg_1152_d);
+        ((half2 *) dst)[1] = __hfma2(reinterpret_cast<const half2 &>(p1), d, neg_1152_d);
+        return;
+    }
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+
     int8_t qs[ne];
     ggml_cuda_memcpy_1<ne, 2>(qs, x[ib].qs + iqs);
 

@@ -2,6 +2,7 @@
 #include "dequantize.cuh"
 
 #include <cstdint>
+#include <type_traits>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
@@ -364,6 +365,142 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
     dequantize_mxfp4(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
+// ---------------------------------------------------------------------------
+// Coalesced half-precision dequantization for the cuBLAS prefill path.
+//
+// The generic block kernels above hand thread `t` the strided window
+// [32*(t%8) + 8*(t/8), +8), so every warp store instruction only covers 1/8 of
+// the sectors it addresses and each thread issues 8 native-width stores. These
+// kernels keep one warp per 256-value block but remap the thread to the
+// contiguous window [8*t, 8*t+7] and emit a single 16 B store per thread, so a
+// warp writes one fully coalesced 512 B segment. Grid/sign table entries are
+// also read 4 or 8 bytes at a time instead of one byte each.
+//
+// Used only when the destination is half (the cuBLAS F16 path on Volta and
+// newer); every other dtype keeps the generic kernels.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ uint32_t dequant_pack_half2(float a, float b) {
+    const half2 h = __floats2half2_rn(a, b);
+    return *reinterpret_cast<const uint32_t *>(&h);
+}
+
+// 8 values per thread, 32 threads per 256-value block.
+#define DEQUANT_FAST_8V(BPB, iblk, t, il, ib)                     \
+    const int64_t iblk = (int64_t) blockIdx.x * BPB + (threadIdx.x / 32); \
+    if (iblk >= nb) {                                             \
+        return;                                                   \
+    }                                                             \
+    const int t  = threadIdx.x % 32;                              \
+    const int il = t % 4;                                         \
+    const int ib = t / 4;
+
+template <int BPB>
+static __global__ void dequantize_block_iq3_s_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    DEQUANT_FAST_8V(BPB, iblk, t, il, ib)
+
+    const block_iq3_s * x = (const block_iq3_s *) vx + iblk;
+    const uint8_t * qs = x->qs + 8*ib;
+
+    const uint32_t g1 = iq3s_grid[qs[2*il + 0] | ((x->qh[ib] << (8 - 2*il)) & 256)];
+    const uint32_t g2 = iq3s_grid[qs[2*il + 1] | ((x->qh[ib] << (7 - 2*il)) & 256)];
+    const float d = (float) x->d * (1 + 2*((x->scales[ib/2] >> 4*(ib%2)) & 0xf));
+    const uint8_t signs = x->signs[4*ib + il];
+
+    uint4 o;
+    o.x = dequant_pack_half2((signs &   1) ? -d*(g1 & 0xff)         : d*(g1 & 0xff),
+                             (signs &   2) ? -d*((g1 >>  8) & 0xff) : d*((g1 >>  8) & 0xff));
+    o.y = dequant_pack_half2((signs &   4) ? -d*((g1 >> 16) & 0xff) : d*((g1 >> 16) & 0xff),
+                             (signs &   8) ? -d*((g1 >> 24) & 0xff) : d*((g1 >> 24) & 0xff));
+    o.z = dequant_pack_half2((signs &  16) ? -d*(g2 & 0xff)         : d*(g2 & 0xff),
+                             (signs &  32) ? -d*((g2 >>  8) & 0xff) : d*((g2 >>  8) & 0xff));
+    o.w = dequant_pack_half2((signs &  64) ? -d*((g2 >> 16) & 0xff) : d*((g2 >> 16) & 0xff),
+                             (signs & 128) ? -d*((g2 >> 24) & 0xff) : d*((g2 >> 24) & 0xff));
+
+    *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
+}
+
+template <int BPB>
+static __global__ void dequantize_block_iq3_xxs_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    DEQUANT_FAST_8V(BPB, iblk, t, il, ib)
+
+    const block_iq3_xxs * x = (const block_iq3_xxs *) vx + iblk;
+    const uint8_t  * q3  = x->qs + 8*ib;
+    const uint16_t * gas = (const uint16_t *)(x->qs + QK_K/4) + 2*ib;
+
+    const uint32_t g1 = iq3xxs_grid[q3[2*il + 0]];
+    const uint32_t g2 = iq3xxs_grid[q3[2*il + 1]];
+    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const float d = (float) x->d * (0.5f + (aux32 >> 28)) * 0.5f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+
+    uint4 o;
+    o.x = dequant_pack_half2((signs &   1) ? -d*(g1 & 0xff)         : d*(g1 & 0xff),
+                             (signs &   2) ? -d*((g1 >>  8) & 0xff) : d*((g1 >>  8) & 0xff));
+    o.y = dequant_pack_half2((signs &   4) ? -d*((g1 >> 16) & 0xff) : d*((g1 >> 16) & 0xff),
+                             (signs &   8) ? -d*((g1 >> 24) & 0xff) : d*((g1 >> 24) & 0xff));
+    o.z = dequant_pack_half2((signs &  16) ? -d*(g2 & 0xff)         : d*(g2 & 0xff),
+                             (signs &  32) ? -d*((g2 >>  8) & 0xff) : d*((g2 >>  8) & 0xff));
+    o.w = dequant_pack_half2((signs &  64) ? -d*((g2 >> 16) & 0xff) : d*((g2 >> 16) & 0xff),
+                             (signs & 128) ? -d*((g2 >> 24) & 0xff) : d*((g2 >> 24) & 0xff));
+
+    *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
+}
+
+template <int BPB>
+static __global__ void dequantize_block_iq2_s_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    DEQUANT_FAST_8V(BPB, iblk, t, il, ib)
+
+    const block_iq2_s * x = (const block_iq2_s *) vx + iblk;
+    const uint2 g = *reinterpret_cast<const uint2 *>(
+        iq2s_grid + (x->qs[4*ib + il] | ((x->qh[ib] << (8 - 2*il)) & 0x300)));
+    const float d = (float) x->d * (0.5f + ((x->scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    const uint8_t signs = x->qs[QK_K/8 + 4*ib + il];
+
+    uint4 o;
+    o.x = dequant_pack_half2((signs &   1) ? -d*(g.x & 0xff)         : d*(g.x & 0xff),
+                             (signs &   2) ? -d*((g.x >>  8) & 0xff) : d*((g.x >>  8) & 0xff));
+    o.y = dequant_pack_half2((signs &   4) ? -d*((g.x >> 16) & 0xff) : d*((g.x >> 16) & 0xff),
+                             (signs &   8) ? -d*((g.x >> 24) & 0xff) : d*((g.x >> 24) & 0xff));
+    o.z = dequant_pack_half2((signs &  16) ? -d*(g.y & 0xff)         : d*(g.y & 0xff),
+                             (signs &  32) ? -d*((g.y >>  8) & 0xff) : d*((g.y >>  8) & 0xff));
+    o.w = dequant_pack_half2((signs &  64) ? -d*((g.y >> 16) & 0xff) : d*((g.y >> 16) & 0xff),
+                             (signs & 128) ? -d*((g.y >> 24) & 0xff) : d*((g.y >> 24) & 0xff));
+
+    *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
+}
+
+// 16 values per thread, 16 threads per 256-value block: two 16 B stores.
+template <int BPB>
+static __global__ void dequantize_block_iq4_xs_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    const int64_t iblk = (int64_t) blockIdx.x * BPB + (threadIdx.x / 16);
+    if (iblk >= nb) {
+        return;
+    }
+    const int t     = threadIdx.x % 16;
+    const int ib    = t / 2;
+    const int half_ = t % 2;
+
+    const block_iq4_xs * x = (const block_iq4_xs *) vx + iblk;
+    const uint8_t * q4 = x->qs + 16*ib + 8*half_;
+    const float d = (float) x->d * ((((x->scales_l[ib/2] >> 4*(ib%2)) & 0xf) |
+        (((x->scales_h >> 2*ib) & 3) << 4)) - 32);
+
+    uint4 lo, hi;
+    lo.x = dequant_pack_half2(d*kvalues_iq4nl[q4[0] & 0xf], d*kvalues_iq4nl[q4[1] & 0xf]);
+    lo.y = dequant_pack_half2(d*kvalues_iq4nl[q4[2] & 0xf], d*kvalues_iq4nl[q4[3] & 0xf]);
+    lo.z = dequant_pack_half2(d*kvalues_iq4nl[q4[4] & 0xf], d*kvalues_iq4nl[q4[5] & 0xf]);
+    lo.w = dequant_pack_half2(d*kvalues_iq4nl[q4[6] & 0xf], d*kvalues_iq4nl[q4[7] & 0xf]);
+    hi.x = dequant_pack_half2(d*kvalues_iq4nl[q4[0] >>  4], d*kvalues_iq4nl[q4[1] >>  4]);
+    hi.y = dequant_pack_half2(d*kvalues_iq4nl[q4[2] >>  4], d*kvalues_iq4nl[q4[3] >>  4]);
+    hi.z = dequant_pack_half2(d*kvalues_iq4nl[q4[4] >>  4], d*kvalues_iq4nl[q4[5] >>  4]);
+    hi.w = dequant_pack_half2(d*kvalues_iq4nl[q4[6] >>  4], d*kvalues_iq4nl[q4[7] >>  4]);
+
+    half * dst = yy + iblk*QK_K + 32*ib + 8*half_;
+    *reinterpret_cast<uint4 *>(dst)      = lo;
+    *reinterpret_cast<uint4 *>(dst + 16) = hi;
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -464,18 +601,39 @@ static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t
 template<typename dst_t>
 static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same_v<dst_t, half>) {
+        if (nb > 0 && (reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            constexpr int BPB = 8;
+            dequantize_block_iq2_s_f16<BPB><<<(nb + BPB - 1)/BPB, 32*BPB, 0, stream>>>(vx, (half *) y, nb);
+            return;
+        }
+    }
     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same_v<dst_t, half>) {
+        if (nb > 0 && (reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            constexpr int BPB = 8;
+            dequantize_block_iq3_xxs_f16<BPB><<<(nb + BPB - 1)/BPB, 32*BPB, 0, stream>>>(vx, (half *) y, nb);
+            return;
+        }
+    }
     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same_v<dst_t, half>) {
+        if (nb > 0 && (reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            constexpr int BPB = 8;
+            dequantize_block_iq3_s_f16<BPB><<<(nb + BPB - 1)/BPB, 32*BPB, 0, stream>>>(vx, (half *) y, nb);
+            return;
+        }
+    }
     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -501,6 +659,13 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+    if constexpr (std::is_same_v<dst_t, half>) {
+        if (nb > 0 && k % QK_K == 0 && (reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            constexpr int BPB = 8;
+            dequantize_block_iq4_xs_f16<BPB><<<(nb + BPB - 1)/BPB, 16*BPB, 0, stream>>>(vx, (half *) y, nb);
+            return;
+        }
+    }
     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 

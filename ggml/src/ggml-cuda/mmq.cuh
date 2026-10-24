@@ -530,6 +530,36 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const bool y_scale_used = y_scale != nullptr;
 
+#if defined(VOLTA_MMA_AVAILABLE)
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        const int i_base = threadIdx.y * 16;
+        const int qp     = (threadIdx.x % 16) / 4;
+        const int qp_row = qp & 1;
+        const int qp_k   = qp >> 1;
+        const int half_w = threadIdx.x / 16;
+        const int tid_qp = threadIdx.x % 4;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += 8) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int i = i_base + qp_row * 8 + half_w * 4 + (l & 2) + (tid_qp & 1);
+                const int j = j0 + qp_k * 4 + (tid_qp & 2) + (l & 1);
+
+                if (j > j_max) {
+                    continue;
+                }
+                if (fallback && i > i_max) {
+                    continue;
+                }
+                dst[ids_dst[j]*stride + i] = sum[(j0 / 8) * 4 + l];
+            }
+        }
+        GGML_UNUSED(y_scale_used);
+        return;
+    }
+#endif // defined(VOLTA_MMA_AVAILABLE)
+
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += nwarps) {
         const int j = j0 + threadIdx.y;

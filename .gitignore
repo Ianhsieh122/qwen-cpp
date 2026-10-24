@@ -48,6 +48,7 @@
 /tags
 /.build/
 /build*
+/ref/
 /release
 /debug
 /libllama.so
@@ -163,3 +164,14 @@ AGENTS.local.md
 /artifacts/
 /release-packages/*/
 /servers
+
+
+# Temporary scratch & profiling
+tmp_*
+*.nsys-rep
+*.sqlite
+*.exp
+*.lib
+telemetry_*.csv
+proc_*.txt
+bench_*.txt

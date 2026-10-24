@@ -4,9 +4,11 @@ llama_add_compile_flags()
 # libraries
 #
 
-# llama
-
-file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
+set(LLAMA_MODELS_SOURCES
+    models/delta-net-base.cpp
+    models/qwen35.cpp
+    models/dflash.cpp
+)
 
 set(LLAMA_CORE_SOURCES
     llama.cpp

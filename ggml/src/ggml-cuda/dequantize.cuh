@@ -337,6 +337,42 @@ static __device__ __forceinline__ void dequantize_q4_K(const void * vx, const in
     const float d1 = dall * sc; const float m1 = dmin * m;
     get_scale_min_k4(is + 1, x[ib].scales, sc, m);
     const float d2 = dall * sc; const float m2 = dmin * m;
+
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    if constexpr (std::is_same_v<dst_t, half>) {
+        // Volta/post-Volta fast in-register 4-bit nibble -> half2 dequantizer using
+        // prmt.b32 (__byte_perm) + lop3.b32 with IEEE-754 FP16 magic constant 0x64006400u (1024.0h).
+        const uint32_t q4    = *reinterpret_cast<const uint32_t *>(q);
+        const uint32_t q4_hi = (q4 >> 4) & 0x0F0F0F0Fu;
+        const uint32_t magic = 0x64006400u;
+
+        uint32_t p_lo01 = __byte_perm(q4, magic, 0x7170);
+        uint32_t p_lo23 = __byte_perm(q4, magic, 0x7372);
+        asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p_lo01));
+        asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p_lo23));
+
+        const uint32_t p_hi01 = __byte_perm(q4_hi, magic, 0x7170);
+        const uint32_t p_hi23 = __byte_perm(q4_hi, magic, 0x7372);
+
+        const half2 neg_1024 = __float2half2_rn(-1024.0f);
+        const half2 d1_h2    = __float2half2_rn(d1);
+        const half2 neg_m1   = __float2half2_rn(-m1);
+        const half2 d2_h2    = __float2half2_rn(d2);
+        const half2 neg_m2   = __float2half2_rn(-m2);
+
+        const half2 lo01 = __hadd2(reinterpret_cast<const half2 &>(p_lo01), neg_1024);
+        const half2 lo23 = __hadd2(reinterpret_cast<const half2 &>(p_lo23), neg_1024);
+        const half2 hi01 = __hadd2(reinterpret_cast<const half2 &>(p_hi01), neg_1024);
+        const half2 hi23 = __hadd2(reinterpret_cast<const half2 &>(p_hi23), neg_1024);
+
+        *reinterpret_cast<half2 *>(y +  0) = __hfma2(lo01, d1_h2, neg_m1);
+        *reinterpret_cast<half2 *>(y +  2) = __hfma2(lo23, d1_h2, neg_m1);
+        *reinterpret_cast<half2 *>(y + 32) = __hfma2(hi01, d2_h2, neg_m2);
+        *reinterpret_cast<half2 *>(y + 34) = __hfma2(hi23, d2_h2, neg_m2);
+        return;
+    }
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+
     for (int l = 0; l < n; ++l) {
         y[l + 0] = ggml_cuda_cast<dst_t>(d1 * (q[l] & 0xF) - m1);
         y[l +32] = ggml_cuda_cast<dst_t>(d2 * (q[l] >>  4) - m2);

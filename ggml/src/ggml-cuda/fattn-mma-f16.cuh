@@ -113,6 +113,18 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
+    // Qwen3.8-27B Gated Attention (DKQ=256, DV=256, GQA=6:1 -> 6 query heads batched per KV head):
+    // On Volta (sm_70), each warp MMA B-tile is tile<8, 4, half2> (8 KV rows).
+    // Setting nbatch_fa = 32 with 4 warps (nthreads = 128) assigns 32 / 4 = 8 KV rows per warp
+    // (Q8_KV_TILE_SIZE = 8, np = 1 B-tile per warp), cutting KV/KQ register pressure in half
+    // and eliminating SM register spilling at up to 262K context.
+    // nbatch_combine = 64 satisfies Volta's 32-row tile_C_VKQ alignment constraint.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  32, 128, 128,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  32, 128, 128,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256, 1, 32, 128, 128, 128, 2, true);
+
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128,  64, 1, false);
 
@@ -126,7 +138,6 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128,  64, 1, false);
 
-    // TODO tune specifically for Volta
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 }
 
