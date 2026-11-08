@@ -501,6 +501,157 @@ static __global__ void dequantize_block_iq4_xs_f16(const void * __restrict__ vx,
     *reinterpret_cast<uint4 *>(dst + 16) = hi;
 }
 
+#define DEQUANT_FAST_8V_SIMPLE(BPB, iblk, t)                     \
+    const int64_t iblk = (int64_t) blockIdx.x * BPB + (threadIdx.x / 32); \
+    if (iblk >= nb) {                                             \
+        return;                                                   \
+    }                                                             \
+    const int t  = threadIdx.x % 32;
+
+static __device__ __forceinline__ uint32_t load_uint32_b2(const void * p) {
+    const uint16_t * p16 = reinterpret_cast<const uint16_t *>(p);
+    return static_cast<uint32_t>(p16[0]) | (static_cast<uint32_t>(p16[1]) << 16);
+}
+
+template <int BPB>
+static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    DEQUANT_FAST_8V_SIMPLE(BPB, iblk, t)
+
+    const block_q4_K * x = (const block_q4_K *) vx + iblk;
+    const float dall = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    const int is = t / 4; // 0..7
+    uint8_t sc, m;
+    get_scale_min_k4(is, x->scales, sc, m);
+    const float d = dall * (float)sc;
+    const float min_val = dmin * (float)m;
+
+    const int q_base = (is / 2) * 32;
+    const int sub = t % 4; // 0..3
+    const int l = sub * 8; // 0, 8, 16, 24
+    const uint8_t * q_ptr = x->qs + q_base + l;
+    const int shift = (is & 1) ? 4 : 0;
+
+    const uint32_t q0 = *reinterpret_cast<const uint32_t *>(q_ptr + 0);
+    const uint32_t q1 = *reinterpret_cast<const uint32_t *>(q_ptr + 4);
+
+    uint4 o;
+    o.x = dequant_pack_half2(d * (float)((q0 >> (shift +  0)) & 0x0F) - min_val,
+                             d * (float)((q0 >> (shift +  8)) & 0x0F) - min_val);
+    o.y = dequant_pack_half2(d * (float)((q0 >> (shift + 16)) & 0x0F) - min_val,
+                             d * (float)((q0 >> (shift + 24)) & 0x0F) - min_val);
+    o.z = dequant_pack_half2(d * (float)((q1 >> (shift +  0)) & 0x0F) - min_val,
+                             d * (float)((q1 >> (shift +  8)) & 0x0F) - min_val);
+    o.w = dequant_pack_half2(d * (float)((q1 >> (shift + 16)) & 0x0F) - min_val,
+                             d * (float)((q1 >> (shift + 24)) & 0x0F) - min_val);
+
+    *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
+}
+
+template <int BPB>
+static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    DEQUANT_FAST_8V_SIMPLE(BPB, iblk, t)
+
+    const block_q5_K * x = (const block_q5_K *) vx + iblk;
+    const float dall = __low2float(x->dm);
+    const float dmin = __high2float(x->dm);
+
+    const int is = t / 4; // 0..7
+    uint8_t sc, m;
+    get_scale_min_k4(is, x->scales, sc, m);
+    const float d = dall * (float)sc;
+    const float min_val = dmin * (float)m;
+
+    const int q_base = (is / 2) * 32;
+    const int sub = t % 4; // 0..3
+    const int l = sub * 8; // 0, 8, 16, 24
+    const uint8_t * ql_ptr = x->qs + q_base + l;
+    const uint8_t * qh_ptr = x->qh + l;
+    const int shift = (is & 1) ? 4 : 0;
+    const uint8_t hm = 1 << is;
+
+    const uint32_t q0 = *reinterpret_cast<const uint32_t *>(ql_ptr + 0);
+    const uint32_t q1 = *reinterpret_cast<const uint32_t *>(ql_ptr + 4);
+    const uint32_t qh0 = *reinterpret_cast<const uint32_t *>(qh_ptr + 0);
+    const uint32_t qh1 = *reinterpret_cast<const uint32_t *>(qh_ptr + 4);
+
+    float val[8];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint8_t ql_val0 = (q0 >> (k * 8)) & 0xFF;
+        const uint8_t qh_val0 = (qh0 >> (k * 8)) & 0xFF;
+        const int q_val0 = ((ql_val0 >> shift) & 0x0F) + (qh_val0 & hm ? 16 : 0);
+        val[k] = d * (float) q_val0 - min_val;
+
+        const uint8_t ql_val1 = (q1 >> (k * 8)) & 0xFF;
+        const uint8_t qh_val1 = (qh1 >> (k * 8)) & 0xFF;
+        const int q_val1 = ((ql_val1 >> shift) & 0x0F) + (qh_val1 & hm ? 16 : 0);
+        val[k + 4] = d * (float) q_val1 - min_val;
+    }
+
+    uint4 o;
+    o.x = dequant_pack_half2(val[0], val[1]);
+    o.y = dequant_pack_half2(val[2], val[3]);
+    o.z = dequant_pack_half2(val[4], val[5]);
+    o.w = dequant_pack_half2(val[6], val[7]);
+
+    *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
+}
+
+template <int BPB>
+static __global__ void dequantize_block_q6_K_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    DEQUANT_FAST_8V_SIMPLE(BPB, iblk, t)
+
+    const block_q6_K * x = (const block_q6_K *) vx + iblk;
+    const float d = x->d;
+
+    const int half_idx  = t / 16;        // 0 or 1
+    const int t_in_half = t % 16;        // 0..15
+    const int chunk     = t_in_half / 4; // 0..3
+    const int sub       = t_in_half % 4; // 0..3
+    const int l         = sub * 8;       // 0, 8, 16, 24
+
+    const uint8_t * ql_half = x->ql + half_idx * 64;
+    const uint8_t * qh_half = x->qh + half_idx * 32;
+
+    const int ql_base  = (chunk & 1) ? 32 : 0;
+    const int ql_shift = (chunk & 2) ? 4 : 0;
+    const int qh_shift = chunk * 2;
+
+    const uint8_t * ql_ptr = ql_half + ql_base + l;
+    const uint8_t * qh_ptr = qh_half + l;
+
+    const float d_sc = d * (float) x->scales[t / 2];
+
+    const uint32_t ql_w0 = load_uint32_b2(ql_ptr + 0);
+    const uint32_t ql_w1 = load_uint32_b2(ql_ptr + 4);
+    const uint32_t qh_w0 = load_uint32_b2(qh_ptr + 0);
+    const uint32_t qh_w1 = load_uint32_b2(qh_ptr + 4);
+
+    float val[8];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint8_t ql0 = (ql_w0 >> (k * 8)) & 0xFF;
+        const uint8_t qh0 = (qh_w0 >> (k * 8)) & 0xFF;
+        const int8_t q_val0 = (int8_t)(((ql0 >> ql_shift) & 0x0F) | (((qh0 >> qh_shift) & 3) << 4)) - 32;
+        val[k] = d_sc * (float) q_val0;
+
+        const uint8_t ql1 = (ql_w1 >> (k * 8)) & 0xFF;
+        const uint8_t qh1 = (qh_w1 >> (k * 8)) & 0xFF;
+        const int8_t q_val1 = (int8_t)(((ql1 >> ql_shift) & 0x0F) | (((qh1 >> qh_shift) & 3) << 4)) - 32;
+        val[k + 4] = d_sc * (float) q_val1;
+    }
+
+    uint4 o;
+    o.x = dequant_pack_half2(val[0], val[1]);
+    o.y = dequant_pack_half2(val[2], val[3]);
+    o.z = dequant_pack_half2(val[4], val[5]);
+    o.w = dequant_pack_half2(val[6], val[7]);
+
+    *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -571,18 +722,39 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same_v<dst_t, half>) {
+        if (nb > 0 && k % QK_K == 0 && (reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            constexpr int BPB = 8;
+            dequantize_block_q4_K_f16<BPB><<<(nb + BPB - 1)/BPB, 32*BPB, 0, stream>>>(vx, (half *) y, nb);
+            return;
+        }
+    }
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same_v<dst_t, half>) {
+        if (nb > 0 && k % QK_K == 0 && (reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            constexpr int BPB = 8;
+            dequantize_block_q5_K_f16<BPB><<<(nb + BPB - 1)/BPB, 32*BPB, 0, stream>>>(vx, (half *) y, nb);
+            return;
+        }
+    }
     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if constexpr (std::is_same_v<dst_t, half>) {
+        if (nb > 0 && k % QK_K == 0 && (reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            constexpr int BPB = 8;
+            dequantize_block_q6_K_f16<BPB><<<(nb + BPB - 1)/BPB, 32*BPB, 0, stream>>>(vx, (half *) y, nb);
+            return;
+        }
+    }
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 

@@ -4,6 +4,7 @@ param(
     [string]$BuildName = "build-win-cuda-v100",
     [string]$Target = "",
     [int]$Parallel = 16,
+    [string]$CudaArch = "70;86",
     [switch]$Package = $false,
     [switch]$StdQuantIteration = $false,
     [switch]$AllTests = $false,
@@ -23,7 +24,7 @@ if (Test-Path "C:\qwen-cpp") {
 Set-Location $repoRoot
 
 $cudaVer = "12.9"
-$cudaArch = "70" # Tesla V100 / Volta sm_70
+$cudaArch = $CudaArch
 $cudaBase = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
 $cudaPath = Join-Path $cudaBase "v$cudaVer"
 $ninjaExe = Get-Command ninja.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source

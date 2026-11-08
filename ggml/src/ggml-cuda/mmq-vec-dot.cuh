@@ -1124,7 +1124,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
-// #pragma unroll
+    // Row base scales are invariant over the k01 and j0 loops; load once to registers
+    float x_df_reg[I / warp_size];
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += warp_size) {
+        const int i = i0 + threadIdx.x;
+        x_df_reg[i0 / warp_size] = x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K];
+    }
+
+#pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR6_K*VDR_Q6_K_Q8_1_MMQ) {
         const int k0 = k00 + k01;
 
@@ -1140,7 +1148,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q6_K_q8_1_impl_mmq(
                     &x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc,
-                    x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K], &y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_df_reg[i0 / warp_size], &y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
             }
         }
     }
