@@ -1124,9 +1124,8 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
         const uint32_t p1 = __byte_perm(x_u, magic, 0x7372);
         const half2 d = __half2half2(x[ib].d);
         const half2 neg_1152 = __float2half2_rn(-1152.0f);
-        const half2 neg_1152_d = __hmul2(neg_1152, d);
-        ((half2 *) dst)[0] = __hfma2(reinterpret_cast<const half2 &>(p0), d, neg_1152_d);
-        ((half2 *) dst)[1] = __hfma2(reinterpret_cast<const half2 &>(p1), d, neg_1152_d);
+        ((half2 *) dst)[0] = __hmul2(__hadd2(reinterpret_cast<const half2 &>(p0), neg_1152), d);
+        ((half2 *) dst)[1] = __hmul2(__hadd2(reinterpret_cast<const half2 &>(p1), neg_1152), d);
         return;
     }
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA

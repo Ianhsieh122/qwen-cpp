@@ -222,6 +222,14 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+static bool ggml_cuda_p2p_requested() {
+    const char * env = getenv("GGML_CUDA_P2P");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+    return strcmp(env, "0") != 0 && strcmp(env, "false") != 0 && strcmp(env, "off") != 0 && strcmp(env, "no") != 0;
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -388,17 +396,22 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
 
-    if (getenv("GGML_CUDA_P2P") != nullptr) {
+    if (ggml_cuda_p2p_requested()) {
         for (int id = 0; id < info.physical_device_count; ++id) {
             CUDA_CHECK(cudaSetDevice(id));
             for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
                 if (id == id_other) {
                     continue;
                 }
-                int can_access_peer;
+                int can_access_peer = 0;
                 CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
                 if (can_access_peer) {
-                    CUDA_CHECK(cudaDeviceEnablePeerAccess(id_other, 0));
+                    const cudaError_t p2p_err = cudaDeviceEnablePeerAccess(id_other, 0);
+                    if (p2p_err != cudaSuccess && p2p_err != cudaErrorPeerAccessAlreadyEnabled) {
+                        GGML_LOG_WARN("%s: failed to enable CUDA peer access between GPU %d and GPU %d (%s); continuing with host-staged transfers\n",
+                            __func__, id, id_other, cudaGetErrorString(p2p_err));
+                        (void) cudaGetLastError();
+                    }
                 }
             }
         }
@@ -602,8 +615,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // the memory allocation handle is no longer needed after mapping
             CU_CHECK(cuMemRelease(handle));
 
-            // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
-            bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
+            // VMM Bug fix for P2P access if GGML_CUDA_P2P is explicitly enabled, or if NCCL build
+            bool use_peer_access = ggml_cuda_p2p_requested();
 #if defined(GGML_USE_NCCL)
             use_peer_access = true;
 #endif // defined(GGML_USE_NCCL)
