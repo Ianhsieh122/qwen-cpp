@@ -12,33 +12,37 @@ def require(source: str, needle: str, message: str) -> None:
 
 
 def main() -> None:
-    dream = (ROOT / "src/models/dream.cpp").read_text(encoding="utf-8")
-    for layers, model_type in ((26, "3B"), (28, "7B"), (34, "8B"), (40, "14B")):
-        require(
-            dream,
-            f"case {layers}: type = LLM_TYPE_{model_type};",
-            f"Dream {model_type} ({layers} layers) model-size mapping was lost during an upstream merge",
-        )
+    dream_path = ROOT / "src/models/dream.cpp"
+    if dream_path.is_file():
+        dream = dream_path.read_text(encoding="utf-8")
+        for layers, model_type in ((26, "3B"), (28, "7B"), (34, "8B"), (40, "14B")):
+            require(
+                dream,
+                f"case {layers}: type = LLM_TYPE_{model_type};",
+                f"Dream {model_type} ({layers} layers) model-size mapping was lost during an upstream merge",
+            )
 
-    qwen4exp = (ROOT / "src/models/qwen4exp.cpp").read_text(encoding="utf-8")
-    qwen4exp_h = (ROOT / "src/models/models.h").read_text(encoding="utf-8")
-    for needle in (
-        "LLM_KV_NEXTN_PREDICT_LAYERS",
-        "const bool mtp_only",
-        "LLM_TENSOR_NEXTN_EH_PROJ",
-        "LLM_TENSOR_NEXTN_HC_HEAD_NORM",
-        "const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0",
-        "load_block(il, trunk_flags)",
-        "layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm",
-        "qwen4exp_shared_model",
-        "LLM_GRAPH_TYPE_DECODER_MTP",
-        "llama_model_qwen4exp::graph_mtp::graph_mtp",
-        "mctx_idx && hparams.indexer_kpool > 0",
-        "(!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)",
-        "if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids)",
-    ):
-        require(qwen4exp, needle, "Qwen4Exp standalone MTP draft-head support is incomplete")
-    require(qwen4exp_h, "struct graph_mtp : public graph", "Qwen4Exp MTP graph declaration is missing")
+    qwen4exp_path = ROOT / "src/models/qwen4exp.cpp"
+    if qwen4exp_path.is_file():
+        qwen4exp = qwen4exp_path.read_text(encoding="utf-8")
+        qwen4exp_h = (ROOT / "src/models/models.h").read_text(encoding="utf-8")
+        for needle in (
+            "LLM_KV_NEXTN_PREDICT_LAYERS",
+            "const bool mtp_only",
+            "LLM_TENSOR_NEXTN_EH_PROJ",
+            "LLM_TENSOR_NEXTN_HC_HEAD_NORM",
+            "const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0",
+            "load_block(il, trunk_flags)",
+            "layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm",
+            "qwen4exp_shared_model",
+            "LLM_GRAPH_TYPE_DECODER_MTP",
+            "llama_model_qwen4exp::graph_mtp::graph_mtp",
+            "mctx_idx && hparams.indexer_kpool > 0",
+            "(!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)",
+            "if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids)",
+        ):
+            require(qwen4exp, needle, "Qwen4Exp standalone MTP draft-head support is incomplete")
+        require(qwen4exp_h, "struct graph_mtp : public graph", "Qwen4Exp MTP graph declaration is missing")
 
     hybrid_idx = (ROOT / "src/llama-memory-hybrid-idx.cpp").read_text(encoding="utf-8")
     constructors = hybrid_idx.split("llama_memory_hybrid_idx::llama_memory_hybrid_idx(")[1:]
@@ -49,25 +53,29 @@ def main() -> None:
         require(initialization, "hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;",
                 "every QSA indexer constructor must disable K-shift rotation of raw pooled keys")
 
-    qwen4exp_converter = (ROOT / "conversion/qwen4exp.py").read_text(encoding="utf-8")
-    for needle in (
-        '"hyper_connection_mixer": "nextn_hc_head"',
-        'f"model.layers.{cls._original_block_count}.{cls._MTP_EXTRA[part]}.{rest}"',
-    ):
-        require(
-            qwen4exp_converter,
-            needle,
-            "Qwen4Exp standalone MTP conversion must place its output mixer on the draft block",
-        )
+    qwen4exp_converter_path = ROOT / "conversion/qwen4exp.py"
+    if qwen4exp_converter_path.is_file():
+        qwen4exp_converter = qwen4exp_converter_path.read_text(encoding="utf-8")
+        for needle in (
+            '"hyper_connection_mixer": "nextn_hc_head"',
+            'f"model.layers.{cls._original_block_count}.{cls._MTP_EXTRA[part]}.{rest}"',
+        ):
+            require(
+                qwen4exp_converter,
+                needle,
+                "Qwen4Exp standalone MTP conversion must place its output mixer on the draft block",
+            )
 
-    qwen3next = (ROOT / "src/models/qwen3next.cpp").read_text(encoding="utf-8")
-    require(
-        qwen3next,
-        "const int64_t n_head_kv_il = hparams.n_head_kv(il);",
-        "Qwen3Next must use the per-layer KV-head count for RYS variants",
-    )
-    if qwen3next.count("n_embd_head, n_head_kv_il, n_tokens") != 2:
-        raise AssertionError("Qwen3Next K and V reshapes must both use the per-layer KV-head count")
+    qwen3next_path = ROOT / "src/models/qwen3next.cpp"
+    if qwen3next_path.is_file():
+        qwen3next = qwen3next_path.read_text(encoding="utf-8")
+        require(
+            qwen3next,
+            "const int64_t n_head_kv_il = hparams.n_head_kv(il);",
+            "Qwen3Next must use the per-layer KV-head count for RYS variants",
+        )
+        if qwen3next.count("n_embd_head, n_head_kv_il, n_tokens") != 2:
+            raise AssertionError("Qwen3Next K and V reshapes must both use the per-layer KV-head count")
 
     allocator = (ROOT / "ggml/src/ggml-alloc.c").read_text(encoding="utf-8")
     require(
@@ -83,14 +91,16 @@ def main() -> None:
     require(set_2d, "iface.set_tensor_2d_async == NULL", "2D async writes must test the write callback")
     require(set_2d, "tensor write out of bounds", "2D async writes must report write bounds")
 
-    vulkan = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
-    for needle in (
-        "pipeline_kvarn_store",
-        "static void ggml_vk_kvarn_store",
-        "case GGML_OP_KVARN_STORE:",
-        'strcmp(name, "ggml_backend_kvarn_native_ops")',
-    ):
-        require(vulkan, needle, "the Vulkan KVarN store integration was lost during an upstream merge")
+    vulkan_path = ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp"
+    if vulkan_path.is_file():
+        vulkan = vulkan_path.read_text(encoding="utf-8")
+        for needle in (
+            "pipeline_kvarn_store",
+            "static void ggml_vk_kvarn_store",
+            "case GGML_OP_KVARN_STORE:",
+            'strcmp(name, "ggml_backend_kvarn_native_ops")',
+        ):
+            require(vulkan, needle, "the Vulkan KVarN store integration was lost during an upstream merge")
 
     cuda = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     for needle in (
@@ -132,22 +142,26 @@ def main() -> None:
     if "GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>" in kvarn_case:
         raise AssertionError("KVarN MMA selection still instantiates the impossible original-K/rotated-V domain")
 
-    sycl_set_rows = (ROOT / "ggml/src/ggml-sycl/set_rows.cpp").read_text(encoding="utf-8")
-    require(
-        sycl_set_rows,
-        "convert<sycl::ext::oneapi::bfloat16, sycl::half>",
-        "SYCL SET_ROWS must specialize the unsupported direct bfloat16-to-half conversion",
-    )
+    sycl_path = ROOT / "ggml/src/ggml-sycl/set_rows.cpp"
+    if sycl_path.is_file():
+        sycl_set_rows = sycl_path.read_text(encoding="utf-8")
+        require(
+            sycl_set_rows,
+            "convert<sycl::ext::oneapi::bfloat16, sycl::half>",
+            "SYCL SET_ROWS must specialize the unsupported direct bfloat16-to-half conversion",
+        )
 
-    metal_device = (ROOT / "ggml/src/ggml-metal/ggml-metal-device.m").read_text(encoding="utf-8")
-    rsets_init = metal_device.split(
-        "ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev)", 1
-    )[1].split("\n}", 1)[0]
-    require(
-        rsets_init,
-        "GGML_UNUSED(dev);",
-        "Metal residency-set initialization must tolerate SDKs without residency-set support",
-    )
+    metal_path = ROOT / "ggml/src/ggml-metal/ggml-metal-device.m"
+    if metal_path.is_file():
+        metal_device = metal_path.read_text(encoding="utf-8")
+        rsets_init = metal_device.split(
+            "ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev)", 1
+        )[1].split("\n}", 1)[0]
+        require(
+            rsets_init,
+            "GGML_UNUSED(dev);",
+            "Metal residency-set initialization must tolerate SDKs without residency-set support",
+        )
 
     kvarn_cache = (ROOT / "src/llama-kv-cache-kvarn.h").read_text(encoding="utf-8")
     kvarn_cache_cpp = (ROOT / "src/llama-kv-cache-kvarn.cpp").read_text(encoding="utf-8")

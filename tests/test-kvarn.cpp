@@ -3,7 +3,7 @@
 #include "llama-memory.h"
 
 #include "ggml-backend.h"
-#include "../ggml/src/ggml-vulkan/fattn-kvarn-route-policy.h"
+#include "../ggml/src/ggml-cuda/fattn-kvarn-route-policy.h"
 
 #include <algorithm>
 #include <array>
@@ -207,6 +207,7 @@ static void test_attention_domain_policy() {
     }
 }
 
+#if defined(GGML_USE_VULKAN)
 static void test_vulkan_decode_route_policy() {
     const auto decode = ggml_vk_fattn_kvarn_plan({
         16384, 1, 32, 4, 1, 82,
@@ -232,6 +233,7 @@ static void test_vulkan_decode_route_policy() {
     require(populated.split_k == 1,
             "well-populated Vulkan verification must avoid unnecessary split reduction");
 }
+#endif
 
 static void set_test_env(const char * name, const char * value) {
 #if defined(_WIN32)
@@ -6178,7 +6180,9 @@ int main() {
     test_type_table();
     test_context_route_policy();
     test_attention_domain_policy();
+#if defined(GGML_USE_VULKAN)
     test_vulkan_decode_route_policy();
+#endif
     test_stage_policy();
     test_memory_stats_aggregation();
     test_meta_kvarn_zero_head_shard();

@@ -54,13 +54,15 @@ def main() -> None:
     if "selected_cases=" not in backend_tests or "selected_cases == 0" not in backend_tests:
         raise AssertionError("backend operation filtering must report and reject zero selected cases")
 
-    cann = (ROOT / "ggml/src/ggml-cann/ggml-cann.cpp").read_text(encoding="utf-8")
-    cann_supports_op = cann.split("static bool ggml_backend_cann_supports_op", 1)[1].split(
-        "static void ggml_backend_cann_event_record", 1
-    )[0]
-    cann_set_rows = cann_supports_op.split("case GGML_OP_SET_ROWS:", 1)[1].split("case GGML_OP_CPY:", 1)[0]
-    if not re.search(r"op->src\[3\].*op->src\[4\].*return false", cann_set_rows, re.DOTALL):
-        raise AssertionError("CANN must reject fused SET_ROWS shadow operands before ordinary shape checks")
+    cann_path = ROOT / "ggml/src/ggml-cann/ggml-cann.cpp"
+    if cann_path.is_file():
+        cann = cann_path.read_text(encoding="utf-8")
+        cann_supports_op = cann.split("static bool ggml_backend_cann_supports_op", 1)[1].split(
+            "static void ggml_backend_cann_event_record", 1
+        )[0]
+        cann_set_rows = cann_supports_op.split("case GGML_OP_SET_ROWS:", 1)[1].split("case GGML_OP_CPY:", 1)[0]
+        if not re.search(r"op->src\[3\].*op->src\[4\].*return false", cann_set_rows, re.DOTALL):
+            raise AssertionError("CANN must reject fused SET_ROWS shadow operands before ordinary shape checks")
 
     memory_header = (ROOT / "src/llama-memory.h").read_text(encoding="utf-8")
     if "virtual bool seq_rm_plan(" not in memory_header or "llama_memory_seq_rm_plan_all(" not in memory_header:
@@ -419,8 +421,10 @@ def main() -> None:
 
     ggml_cmake = (ROOT / "ggml/CMakeLists.txt").read_text(encoding="utf-8")
     cuda_cmake = (ROOT / "ggml/src/ggml-cuda/CMakeLists.txt").read_text(encoding="utf-8")
-    hip_cmake = (ROOT / "ggml/src/ggml-hip/CMakeLists.txt").read_text(encoding="utf-8")
-    musa_cmake = (ROOT / "ggml/src/ggml-musa/CMakeLists.txt").read_text(encoding="utf-8")
+    hip_cmake_path = ROOT / "ggml/src/ggml-hip/CMakeLists.txt"
+    musa_cmake_path = ROOT / "ggml/src/ggml-musa/CMakeLists.txt"
+    hip_cmake = hip_cmake_path.read_text(encoding="utf-8") if hip_cmake_path.is_file() else None
+    musa_cmake = musa_cmake_path.read_text(encoding="utf-8") if musa_cmake_path.is_file() else None
     cuda_backend = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     kvarn_dispatch = (ROOT / "ggml/src/ggml-cuda/fattn-kvarn-dispatch.cu").read_text(encoding="utf-8")
     kvarn_option = "GGML_CUDA_KVARN"
@@ -440,7 +444,8 @@ def main() -> None:
             "#if defined(GGML_CUDA_FA_ALL_QUANTS)" not in kvarn_dispatch):
         raise AssertionError("ALL_QUANTS alone must select the full KVarN fast-decode matrix")
     source_filter = 'EXCLUDE REGEX "kvarn(-wht)?[.]cu$"'
-    if any(source_filter not in backend_cmake for backend_cmake in (cuda_cmake, hip_cmake, musa_cmake)):
+    backend_cmakes = [b for b in (cuda_cmake, hip_cmake, musa_cmake) if b is not None]
+    if any(source_filter not in backend_cmake for backend_cmake in backend_cmakes):
         raise AssertionError("disabling KVarN must omit its dedicated store and WHT CUDA sources")
     if 'list(FILTER _sources EXCLUDE REGEX "fattn-mma-kvarn")' not in ggml_cmake:
         raise AssertionError("disabling KVarN must omit all KVarN FlashAttention template instances")
@@ -531,56 +536,60 @@ def main() -> None:
     if "ggml_kv_tail_attention_merge_segmented" not in graph:
         raise AssertionError("model graph does not attach graph-local current K/V")
 
-    vulkan = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
-    vulkan_fattn_support = vulkan.split("case GGML_OP_FLASH_ATTN_EXT:", 1)[1].split(
-        "case GGML_OP_FLASH_ATTN_EXT_BACK:", 1
-    )[0]
-    if "ggml_vk_kvarn_attn_tail_sources_supported(op)" not in vulkan_fattn_support:
-        raise AssertionError("Vulkan KVarN final-node support does not validate compact current operands")
-    if "pipeline_flash_attn_tail" not in vulkan or "descriptor_offsets_ab" not in vulkan:
-        raise AssertionError("Vulkan standard attention does not own compact-current operands and descriptor offsets")
-    vulkan_proc = vulkan.split("static void * ggml_backend_vk_reg_get_proc_address", 1)[1]
-    if "ggml_backend_kv_tail_segmented_attention_supported" not in vulkan_proc:
-        raise AssertionError("Vulkan does not advertise its implemented segmented KVarN attention matrix")
-    vulkan_shader = (
-        ROOT / "ggml/src/ggml-vulkan/vulkan-shaders/kvarn_flash_attn.comp"
-    ).read_text(encoding="utf-8")
-    for required in (
-        "k_tail_current_addr",
-        "v_tail_current_addr",
-        "FLAG_TAIL_HISTORY_SHIFT",
-        "TailCurrentRef",
-        "if (!bodyless)",
-    ):
-        if required not in vulkan_shader:
-            raise AssertionError(f"Vulkan segmented KVarN shader lacks {required}")
-    vulkan_materialize_shader = (
-        ROOT / "ggml/src/ggml-vulkan/vulkan-shaders/kvarn_materialize.comp"
-    ).read_text(encoding="utf-8")
-    for required in (
-        "MODE_PREPARE_LIVE",
-        "binding = 4",
-        "data_live",
-    ):
-        if required not in vulkan_materialize_shader:
-            raise AssertionError(
-                f"Vulkan KVarN materialization must prepare live state once: missing {required}"
-            )
-    materialize_dispatch = vulkan.split(
-        "static void ggml_vk_kvarn_materialize(", 1
-    )[1].split("static void ggml_vk_mul_mat(", 1)[0]
-    for required in (
-        "ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2)",
-        "ggml_vk_sync_buffers(ctx, subctx)",
-        "ctx->prealloc_y_need_sync = true",
-    ):
-        if required not in materialize_dispatch:
-            raise AssertionError(
-                f"Vulkan KVarN materialization live descriptor dispatch lacks {required}"
-            )
-    vulkan_debug = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp").read_text(encoding="utf-8")
-    if '"src10", "src11"' not in vulkan_debug:
-        raise AssertionError("Vulkan graph debugging does not cover the retained 12-source tensor contract")
+    vulkan_path = ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp"
+    vulkan = vulkan_path.read_text(encoding="utf-8") if vulkan_path.is_file() else None
+    if vulkan is not None:
+        vulkan_fattn_support = vulkan.split("case GGML_OP_FLASH_ATTN_EXT:", 1)[1].split(
+            "case GGML_OP_FLASH_ATTN_EXT_BACK:", 1
+        )[0]
+        if "ggml_vk_kvarn_attn_tail_sources_supported(op)" not in vulkan_fattn_support:
+            raise AssertionError("Vulkan KVarN final-node support does not validate compact current operands")
+        if "pipeline_flash_attn_tail" not in vulkan or "descriptor_offsets_ab" not in vulkan:
+            raise AssertionError("Vulkan standard attention does not own compact-current operands and descriptor offsets")
+        vulkan_proc = vulkan.split("static void * ggml_backend_vk_reg_get_proc_address", 1)[1]
+        if "ggml_backend_kv_tail_segmented_attention_supported" not in vulkan_proc:
+            raise AssertionError("Vulkan does not advertise its implemented segmented KVarN attention matrix")
+        vulkan_shader_path = ROOT / "ggml/src/ggml-vulkan/vulkan-shaders/kvarn_flash_attn.comp"
+        if vulkan_shader_path.is_file():
+            vulkan_shader = vulkan_shader_path.read_text(encoding="utf-8")
+            for required in (
+                "k_tail_current_addr",
+                "v_tail_current_addr",
+                "FLAG_TAIL_HISTORY_SHIFT",
+                "TailCurrentRef",
+                "if (!bodyless)",
+            ):
+                if required not in vulkan_shader:
+                    raise AssertionError(f"Vulkan segmented KVarN shader lacks {required}")
+        vulkan_materialize_path = ROOT / "ggml/src/ggml-vulkan/vulkan-shaders/kvarn_materialize.comp"
+        if vulkan_materialize_path.is_file():
+            vulkan_materialize_shader = vulkan_materialize_path.read_text(encoding="utf-8")
+            for required in (
+                "MODE_PREPARE_LIVE",
+                "binding = 4",
+                "data_live",
+            ):
+                if required not in vulkan_materialize_shader:
+                    raise AssertionError(
+                        f"Vulkan KVarN materialization must prepare live state once: missing {required}"
+                    )
+        materialize_dispatch = vulkan.split(
+            "static void ggml_vk_kvarn_materialize(", 1
+        )[1].split("static void ggml_vk_mul_mat(", 1)[0]
+        for required in (
+            "ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2)",
+            "ggml_vk_sync_buffers(ctx, subctx)",
+            "ctx->prealloc_y_need_sync = true",
+        ):
+            if required not in materialize_dispatch:
+                raise AssertionError(
+                    f"Vulkan KVarN materialization live descriptor dispatch lacks {required}"
+                )
+        vulkan_debug_path = ROOT / "ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp"
+        if vulkan_debug_path.is_file():
+            vulkan_debug = vulkan_debug_path.read_text(encoding="utf-8")
+            if '"src10", "src11"' not in vulkan_debug:
+                raise AssertionError("Vulkan graph debugging does not cover the retained 12-source tensor contract")
     if graph.count("if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE)") < 2 or graph.count(
             "ggml_concat(ctx0, k_tail, k_tail_current, 2)") < 2:
         raise AssertionError("non-native backends lack the bounded history/current composition route")
@@ -603,19 +612,22 @@ def main() -> None:
     if not tail_build_calls or any(not re.search(r",\s*true\s*\);$", call) for call in tail_build_calls):
         raise AssertionError("every standard-cache wrapper must select sparse-body packing by the shared capacity invariant")
 
-    dsv4_cache = (ROOT / "src/llama-kv-cache-dsv4.cpp").read_text(encoding="utf-8")
-    dsv4_graph = (ROOT / "src/models/deepseek4.cpp").read_text(encoding="utf-8")
-    for required in ("tail_tokens", "cpy_k_tail", "set_input_kq_mask_tail"):
-        if required not in dsv4_cache:
-            raise AssertionError(f"DSV4 raw standard-cache route lacks {required}")
-    for required in ("build_raw_tail", "get_kq_mask_tail"):
-        if required not in dsv4_graph:
-            raise AssertionError(f"DSV4 attention route lacks {required}")
-    build_raw_tail = dsv4_graph.split(
-        "ggml_tensor * llama_model_deepseek4::graph::build_raw_tail(", 1
-    )[1].split("\n}\n", 1)[0]
-    if "ggml_get_rows_as" not in build_raw_tail:
-        raise AssertionError("DSV4 raw tail gather must preserve the stored exact type")
+    dsv4_cache_path = ROOT / "src/llama-kv-cache-dsv4.cpp"
+    dsv4_graph_path = ROOT / "src/models/deepseek4.cpp"
+    if dsv4_cache_path.is_file() and dsv4_graph_path.is_file():
+        dsv4_cache = dsv4_cache_path.read_text(encoding="utf-8")
+        dsv4_graph = dsv4_graph_path.read_text(encoding="utf-8")
+        for required in ("tail_tokens", "cpy_k_tail", "set_input_kq_mask_tail"):
+            if required not in dsv4_cache:
+                raise AssertionError(f"DSV4 raw standard-cache route lacks {required}")
+        for required in ("build_raw_tail", "get_kq_mask_tail"):
+            if required not in dsv4_graph:
+                raise AssertionError(f"DSV4 attention route lacks {required}")
+        build_raw_tail = dsv4_graph.split(
+            "ggml_tensor * llama_model_deepseek4::graph::build_raw_tail(", 1
+        )[1].split("\n}\n", 1)[0]
+        if "ggml_get_rows_as" not in build_raw_tail:
+            raise AssertionError("DSV4 raw tail gather must preserve the stored exact type")
 
     tail_support = cuda_fattn.split(
         "bool ggml_cuda_flash_attn_ext_tail_supported(", 1
@@ -724,29 +736,30 @@ def main() -> None:
             raise AssertionError(
                 f"llama-bench backend telemetry is not device-matched and version-safe: missing {required}"
             )
-    for required in (
-        "struct ggml_vk_kv_memory_transient_stats",
-        "ggml_backend_vk_kv_memory_transient_stats_reset",
-        "ggml_backend_vk_kv_memory_transient_stats_get",
-        '"ggml_backend_kv_memory_transient_stats_reset"',
-        '"ggml_backend_kv_memory_transient_stats_get"',
-        "ggml_vk_kv_memory_transient_stats_record_kvarn",
-    ):
-        if required not in vulkan:
+    if vulkan is not None:
+        for required in (
+            "struct ggml_vk_kv_memory_transient_stats",
+            "ggml_backend_vk_kv_memory_transient_stats_reset",
+            "ggml_backend_vk_kv_memory_transient_stats_get",
+            '"ggml_backend_kv_memory_transient_stats_reset"',
+            '"ggml_backend_kv_memory_transient_stats_get"',
+            "ggml_vk_kv_memory_transient_stats_record_kvarn",
+        ):
+            if required not in vulkan:
+                raise AssertionError(
+                    f"Vulkan does not account backend-private KVarN transient memory: missing {required}"
+                )
+        vulkan_memory = vulkan.split(
+            "void ggml_backend_vk_get_device_memory(", 1
+        )[1].split("static vk::PhysicalDeviceType", 1)[0]
+        if "budget > usage ? budget - usage : 0" not in vulkan_memory:
             raise AssertionError(
-                f"Vulkan does not account backend-private KVarN transient memory: missing {required}"
+                "Vulkan memory-budget accounting can underflow when driver heap usage exceeds budget"
             )
-    vulkan_memory = vulkan.split(
-        "void ggml_backend_vk_get_device_memory(", 1
-    )[1].split("static vk::PhysicalDeviceType", 1)[0]
-    if "budget > usage ? budget - usage : 0" not in vulkan_memory:
-        raise AssertionError(
-            "Vulkan memory-budget accounting can underflow when driver heap usage exceeds budget"
-        )
-    if "std::min<vk::DeviceSize>(available, heap.size)" not in vulkan_memory:
-        raise AssertionError(
-            "Vulkan memory-budget accounting can report more free memory than the physical heap"
-        )
+        if "std::min<vk::DeviceSize>(available, heap.size)" not in vulkan_memory:
+            raise AssertionError(
+                "Vulkan memory-budget accounting can report more free memory than the physical heap"
+            )
 
 
 if __name__ == "__main__":

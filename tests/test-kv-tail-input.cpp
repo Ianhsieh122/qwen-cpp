@@ -17,7 +17,7 @@ int main() {
     ggml_backend_load_all();
     auto backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     check(backend != nullptr, "CPU backend unavailable");
-    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35, llama_model_default_params()));
     // No model tensors: exercise the same metadata cache used by structured caches.
     llama_kv_cache cache(*model, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
             false, false, true, 32, 2, 1, 0, LLAMA_SWA_TYPE_NONE,

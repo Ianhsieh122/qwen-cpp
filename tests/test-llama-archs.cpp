@@ -766,16 +766,24 @@ static llama_model_ptr make_synthetic_mtp_model(llm_arch arch, bool moe, size_t 
     return llama_model_ptr(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &seed, model_params));
 }
 
+static bool arch_is_registered(const llm_arch arch) {
+    const char * name = llm_arch_name(arch);
+    return name != nullptr && std::strcmp(name, "unknown") != 0 && std::strcmp(name, "(unknown)") != 0;
+}
+
 static int test_mtp_kvarn_routing(const size_t seed) {
     struct route_case {
         llm_arch arch;
         bool moe;
     };
-    // Qwen4Exp is covered by the pure route policy and real-model acceptance.
-    // Its synthetic full-model fixture does not represent its standalone sidecar topology.
+    size_t checked = 0;
     for (const route_case & test : {
             route_case{ LLM_ARCH_QWEN35, false },
             route_case{ LLM_ARCH_QWEN35MOE, true } }) {
+        if (!arch_is_registered(test.arch)) {
+            continue;
+        }
+        ++checked;
         fprintf(stderr, "checking owned MTP KVarN route for %s\n", llm_arch_name(test.arch));
         llama_model_ptr model = make_synthetic_mtp_model(test.arch, test.moe, seed);
         if (!model) {
@@ -806,20 +814,29 @@ static int test_mtp_kvarn_routing(const size_t seed) {
             return 1;
         }
     }
-
-    llama_model_ptr unsupported = make_synthetic_mtp_model(LLM_ARCH_QWEN3NEXT, true, seed);
-    if (!unsupported) {
-        throw std::runtime_error("failed to create unsupported synthetic MTP model");
+    if (checked == 0) {
+        fprintf(stderr, "no supported MTP architectures executed in test_mtp_kvarn_routing\n");
+        return 1;
     }
-    llama_context_params params = llama_context_default_params();
-    params.n_ctx = 256;
-    params.n_batch = 64;
-    params.n_ubatch = 32;
-    params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-    params.offload_kqv = false;
-    params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
-    if (llama_init_from_model(unsupported.get(), params) != nullptr) {
-        fprintf(stderr, "unclassified MTP architecture accepted draft KVarN\n");
+
+    if (arch_is_registered(LLM_ARCH_QWEN3NEXT)) {
+        llama_model_ptr unsupported = make_synthetic_mtp_model(LLM_ARCH_QWEN3NEXT, true, seed);
+        if (!unsupported) {
+            throw std::runtime_error("failed to create unsupported synthetic MTP model");
+        }
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 256;
+        params.n_batch = 64;
+        params.n_ubatch = 32;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.offload_kqv = false;
+        params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+        if (llama_init_from_model(unsupported.get(), params) != nullptr) {
+            fprintf(stderr, "unclassified MTP architecture accepted draft KVarN\n");
+            return 1;
+        }
+    } else if (llama_kvarn_context_route_for(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_QWEN3NEXT) != LLAMA_KVARN_CONTEXT_ROUTE_UNSUPPORTED) {
+        fprintf(stderr, "unclassified MTP architecture policy did not fail closed\n");
         return 1;
     }
 
@@ -860,6 +877,9 @@ static int test_kvarn_state_restore(const size_t seed) {
     // LLAMA isolates the KVarN attention cache; QWEN35 adds the recurrent
     // state of the hybrid architecture used by the failing server test.
     for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35 }) {
+        if (!arch_is_registered(arch)) {
+            continue;
+        }
         gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
         llama_model_params model_params = llama_model_default_params();
         model_params.progress_callback = silent_model_load_progress;

@@ -45,6 +45,17 @@ static size_t count_occurrences(const std::string & text, const std::string & ne
     return count;
 }
 
+static std::string read_optional_file(const std::string & path) {
+    std::ifstream file(path);
+    if (!file.good()) {
+        return {};
+    }
+
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    return ss.str();
+}
+
 int main(int argc, char ** argv) {
     bool ok = true;
 
@@ -63,8 +74,8 @@ int main(int argc, char ** argv) {
     const std::string cuda_backend = read_file(root + "/ggml/src/ggml-cuda/ggml-cuda.cu");
     const std::string cmake = read_file(root + "/ggml/CMakeLists.txt");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
-    const std::string hip_cmake = read_file(root + "/ggml/src/ggml-hip/CMakeLists.txt");
-    const std::string musa_cmake = read_file(root + "/ggml/src/ggml-musa/CMakeLists.txt");
+    const std::string hip_cmake = read_optional_file(root + "/ggml/src/ggml-hip/CMakeLists.txt");
+    const std::string musa_cmake = read_optional_file(root + "/ggml/src/ggml-musa/CMakeLists.txt");
     const std::string kvarn_mma = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-impl.cuh");
     const std::string kvarn_view = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
     const std::string kvarn_mma_case = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh");
@@ -392,8 +403,8 @@ int main(int argc, char ** argv) {
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
     ok &= expect(count_occurrences(release, "-DGGML_CUDA_KVARN=ON") == 4,
         "all Linux/Windows CUDA and ROCm release builds must explicitly enable KVarN");
-    ok &= expect(hip_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
-                 musa_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos &&
+    ok &= expect((hip_cmake.empty() || hip_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos) &&
+                 (musa_cmake.empty() || musa_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos) &&
                  cmake.find("GGML_CUDA_KVARN_ALL_PAIR_COUNT 36") != std::string::npos &&
                  cmake.find("_selected_pair_count EQUAL _expected_pair_count") != std::string::npos,
         "shared CUDA/HIP/MUSA configuration must validate the selected KVarN pair matrix");

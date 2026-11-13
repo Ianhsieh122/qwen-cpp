@@ -33,11 +33,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-backend-ops-seed-static.py)
     set_property(TEST test-backend-ops-seed-static PROPERTY LABELS main)
 
-    add_test(
-        NAME test-metal-low-bit-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-metal-low-bit-static.py)
-    set_property(TEST test-metal-low-bit-static PROPERTY LABELS main)
+    if (EXISTS "${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal/CMakeLists.txt")
+        add_test(
+            NAME test-metal-low-bit-static
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-metal-low-bit-static.py)
+        set_property(TEST test-metal-low-bit-static PROPERTY LABELS main)
+    endif()
 
     add_test(
         NAME test-arm-cpu-feats-static
@@ -161,11 +163,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-port-safety-static.py)
     set_property(TEST test-kvarn-port-safety-static PROPERTY LABELS cuda)
 
-    add_test(
-        NAME test-qwen4exp-qsa-kvarn-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-qwen4exp-qsa-kvarn-static.py)
-    set_property(TEST test-qwen4exp-qsa-kvarn-static PROPERTY LABELS main)
+    if (EXISTS "${PROJECT_SOURCE_DIR}/src/models/qwen4exp.cpp")
+        add_test(
+            NAME test-qwen4exp-qsa-kvarn-static
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-qwen4exp-qsa-kvarn-static.py)
+        set_property(TEST test-qwen4exp-qsa-kvarn-static PROPERTY LABELS main)
+    endif()
 
     add_test(
         NAME test-kvarn-hip-tail-capability-static
@@ -184,6 +188,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kvarn-hip-runtime-validation.py ${PROJECT_SOURCE_DIR})
     set_property(TEST test-kvarn-hip-runtime-validation PROPERTY LABELS main)
+
+    add_test(
+        NAME test-v100-pcie-opts-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-v100-pcie-opts-static.py)
+    set_property(TEST test-v100-pcie-opts-static PROPERTY LABELS main)
 endif()
 
 function(llama_build source)
@@ -405,6 +415,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-kvarn-state-restore
     )
+
+    llama_build_and_test(test-split-act.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")

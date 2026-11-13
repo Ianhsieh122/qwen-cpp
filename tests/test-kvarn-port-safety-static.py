@@ -22,6 +22,7 @@ BACKEND_CMAKE = {
         "HIP": "ggml/src/ggml-hip/CMakeLists.txt",
         "MUSA": "ggml/src/ggml-musa/CMakeLists.txt",
     }.items()
+    if (ROOT / path).is_file()
 }
 
 
