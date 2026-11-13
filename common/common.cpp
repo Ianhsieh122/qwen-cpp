@@ -1869,6 +1869,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_tail_tokens = params.kv_tail_tokens.find_first_of(",=") == std::string::npos &&
             params.kv_tail_tokens != "auto" ? std::stoul(params.kv_tail_tokens) : 0;
     cparams.kv_tail_type = params.kv_tail_type;
+    cparams.split_act_type = params.split_act_type;
 
     return cparams;
 }

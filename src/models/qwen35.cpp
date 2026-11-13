@@ -155,8 +155,36 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    auto maybe_compress_boundary = [&](ggml_tensor * t, ggml_backend_dev_t dev_src, ggml_backend_dev_t dev_dst, int il_src, int il_dst) -> ggml_tensor * {
+        if (cparams.split_act_type == GGML_TYPE_F32 || model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
+            return t;
+        }
+        if (dev_src == nullptr || dev_dst == nullptr || dev_src == dev_dst) {
+            return t;
+        }
+        if (ggml_backend_dev_type(dev_src) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+            ggml_backend_dev_type(dev_dst) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return t;
+        }
+        if (t->type != GGML_TYPE_F32 || t->ne[0] % ggml_blck_size(cparams.split_act_type) != 0) {
+            return t;
+        }
+        if (!ggml_is_contiguous(t)) {
+            t = ggml_cont(ctx0, t);
+            cb(t, "split_cont", il_src);
+        }
+        ggml_tensor * comp = ggml_cast(ctx0, t, cparams.split_act_type);
+        cb(comp, "split_compress", il_src);
+        ggml_tensor * decomp = ggml_cast(ctx0, comp, GGML_TYPE_F32);
+        cb(decomp, "split_decompress", il_dst);
+        return decomp;
+    };
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
+        if (il > 0) {
+            inpL = maybe_compress_boundary(inpL, model.dev_layer(il - 1), model.dev_layer(il), il - 1, il);
+        }
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -206,6 +234,10 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
     cur = inpL;
+
+    if (n_layer > 0) {
+        cur = maybe_compress_boundary(cur, model.dev_layer(n_layer - 1), model.dev_output(), n_layer - 1, -1);
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 

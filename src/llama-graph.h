@@ -991,6 +991,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.split_act_type          == other.cparams.split_act_type          &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

@@ -336,6 +336,19 @@ tests.
 | `GGML_CUDA_DQ_Q6K` | Arch default (on for RDNA3.5) | Same `0`/`1`/arch-default semantics for the Q6_K dequant-float matvec arm. |
 | `GGML_CUDA_DQ_ROWS` | `1` | Rows per block for the dequant matvec kernels. Only `1`/`2`/`4`/`8` are instantiated; anything else warns and uses `1`. |
 
+## Multi-GPU split compression, sampling, and draft placement
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--split-act-type TYPE` | `LLAMA_ARG_SPLIT_ACT_TYPE` | `none` (`f32`) | Compresses F32 layer-boundary activations across GPU devices in `--split-mode layer` for `qwen35` models. Accepts `none`, `f32`, `f16` (2x), `bf16` (2x), or `q8_0` (~3.76x, requires `n_embd % 32 == 0`). Nodes are pinned to source/destination GPU devices; unsupported backends warn and fall back to `f32`. |
+| `-bs`, `--backend-sampling` | `LLAMA_ARG_BACKEND_SAMPLING` | Off | Upstream flag that keeps token sampling on the output GPU (`dev_output()`) rather than copying full `n_vocab` logits over PCIe to the host. Automatically disabled when grammars or reasoning budgets are active. |
+| `--spec-draft-backend-sampling` / `--no-spec-draft-backend-sampling` | `LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING` | On | Upstream toggle controlling backend-side draft sampling. |
+| `-ngld N`, `--spec-draft-ngl N` | `LLAMA_ARG_SPEC_DRAFT_NGL` | `auto` | Sets draft model GPU layers (`N`, `auto`, or `all`). Keep draft weights on GPU (`99` or `auto`) instead of `0` on dual-V100 setups to avoid host round-trips. |
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `GGML_CUDA_P2P` | Unset (off) | Set to `1` to opt into `cudaDeviceEnablePeerAccess` and CUDA VMM peer permissions between physical GPUs. Empty string, `0`, `false`, `off`, and `no` leave P2P disabled. If `cudaDeviceEnablePeerAccess` fails at init, ggml logs a warning and falls back to host-staged copies. Still opt-in because some motherboards/BIOS/IOMMU (`VT-d`/`AMD-Vi`/ACS) or narrow PCIe topologies can stall or corrupt peer transfers; see [multi-GPU guide](multi-gpu.md#6-with-cuda-peer-to-peer-access-ggml_cuda_p2p). |
+
 ## Migration from earlier versions
 
 | Earlier spelling or surface | v0.4.0 behavior | Replacement |

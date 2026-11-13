@@ -517,6 +517,10 @@ extern "C" {
         enum ggml_type kv_tail_type;
         const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
         const struct llama_kv_tail_request * kv_tail_request; // model-independent; borrowed during context creation
+
+        // Activation tensor type used at cross-GPU LLAMA_SPLIT_MODE_LAYER boundaries.
+        // GGML_TYPE_F32 disables compression; F16, BF16, and Q8_0 reduce PCIe transfer size.
+        enum ggml_type split_act_type;
     };
 
     struct llama_model_tensor_override {

@@ -726,6 +726,27 @@ process exit as a failed measurement rather than a score.
 The base file is tied to its vocabulary, evaluation tokens, and context size.
 It is a measurement artifact, not a portable model format.
 
+## Multi-GPU layer-split compression and slow-PCIe options
+
+### What it is
+
+On dual-GPU systems connected over narrow PCIe links (such as dual Tesla V100 over PCIe 2.0 x1), cross-GPU activation transfers under `--split-mode layer` and host-side `n_vocab` logit readbacks can dominate prompt prefill and token generation latency. Bee adds `--split-act-type` (`f16`, `bf16`, `q8_0`) to cast F32 cross-GPU boundary tensors on `qwen35` before PCIe transfer and cast back to F32 on the receiving GPU, paired with upstream `--backend-sampling` and GPU draft placement (`-ngld`).
+
+### Key arguments
+
+- [`--split-act-type`](beellama-args.md#multi-gpu-split-compression-sampling-and-draft-placement)
+- [`-bs`, `--backend-sampling`](beellama-args.md#multi-gpu-split-compression-sampling-and-draft-placement)
+- [`-ngld`, `--spec-draft-ngl`](beellama-args.md#multi-gpu-split-compression-sampling-and-draft-placement)
+- [`GGML_CUDA_P2P`](beellama-args.md#multi-gpu-split-compression-sampling-and-draft-placement)
+
+### Measurement and validation
+
+Compare `--split-act-type none` vs `f16` / `q8_0` using identical model weights, prompt, `--split-mode layer`, `--tensor-split`, and `--backend-sampling` settings. Verify both throughput (`tok/s`) and perplexity/KLD before selecting `q8_0` or `f16` in production.
+
+### Known limitations
+
+`--split-act-type` currently instruments `qwen35` layer-to-layer and final-layer-to-output GPU boundaries under `--split-mode layer`. CPU boundaries are left in F32. `GGML_CUDA_P2P=1` remains opt-in and topology-dependent; see [multi-GPU troubleshooting](multi-gpu.md#troubleshooting) if peer access fails or destabilizes under IOMMU/ACS.
+
 ## Removed systems
 
 TurboQuant/TCQ, DDTree, CopySpec, the fork DFlash ring/capture/tape and reduced

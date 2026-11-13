@@ -432,6 +432,17 @@ llama_context::llama_context(
         throw std::invalid_argument("KV tail type must be F16, BF16, or the cache-family default");
     }
     cparams.kv_tail_type = params.kv_tail_type;
+    if (params.split_act_type != GGML_TYPE_F32 &&
+            params.split_act_type != GGML_TYPE_F16 &&
+            params.split_act_type != GGML_TYPE_BF16 &&
+            params.split_act_type != GGML_TYPE_Q8_0) {
+        throw std::invalid_argument("split_act_type must be F32, F16, BF16, or Q8_0");
+    }
+    cparams.split_act_type = params.split_act_type;
+    if (cparams.split_act_type != GGML_TYPE_F32 && model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1) {
+        LLAMA_LOG_INFO("%s: cross-GPU layer-split activation compression enabled (%s)\n",
+                __func__, ggml_type_name(cparams.split_act_type));
+    }
     bool tail_request_resolved = false;
     if (params.kv_tail_request && params.kv_tail_config) {
         throw std::invalid_argument("KV tail request and model-bound config are mutually exclusive");
@@ -948,6 +959,35 @@ llama_context::llama_context(
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+
+        if (cparams.split_act_type != GGML_TYPE_F32 &&
+                model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+                model.n_devices() > 1) {
+            struct ggml_init_params probe_params = {
+                /*.mem_size   =*/ 4 * ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr probe_ctx(ggml_init(probe_params));
+            if (probe_ctx) {
+                ggml_tensor * t_f32  = ggml_new_tensor_1d(probe_ctx.get(), GGML_TYPE_F32, 32);
+                ggml_tensor * t_comp = ggml_cast(probe_ctx.get(), t_f32, cparams.split_act_type);
+                ggml_tensor * t_dec  = ggml_cast(probe_ctx.get(), t_comp, GGML_TYPE_F32);
+                for (const auto & backend : backends) {
+                    auto * dev = ggml_backend_get_device(backend.get());
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        continue;
+                    }
+                    if (!ggml_backend_supports_op(backend.get(), t_comp) ||
+                            !ggml_backend_supports_op(backend.get(), t_dec)) {
+                        LLAMA_LOG_WARN("%s: backend '%s' does not support %s <-> F32 boundary compression; falling back to F32\n",
+                                __func__, ggml_backend_name(backend.get()), ggml_type_name(cparams.split_act_type));
+                        cparams.split_act_type = GGML_TYPE_F32;
+                        break;
+                    }
+                }
+            }
+        }
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
@@ -3292,6 +3332,31 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         }
 
+        // Pin cross-GPU boundary compression/decompression nodes to their respective
+        // source and destination devices regardless of ubatch size or offload depth so
+        // ggml_backend_sched transfers the compressed tensor over PCIe instead of F32.
+        if (strcmp(name, "split_cont") == 0 || strcmp(name, "split_compress") == 0) {
+            if (il >= 0) {
+                const auto & dev_layer = model.dev_layer(il);
+                for (const auto & backend : backends) {
+                    if (ggml_backend_get_device(backend.get()) == dev_layer &&
+                            ggml_backend_supports_op(backend.get(), cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                        break;
+                    }
+                }
+            }
+        } else if (strcmp(name, "split_decompress") == 0) {
+            const auto & dev_target = (il >= 0) ? model.dev_layer(il) : model.dev_output();
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_target &&
+                        ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
+        }
+
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
@@ -4758,6 +4823,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_type                =*/ GGML_TYPE_COUNT,
         /*.kv_tail_config              =*/ nullptr,
         /*.kv_tail_request             =*/ nullptr,
+        /*.split_act_type              =*/ GGML_TYPE_F32,
     };
 
     return result;

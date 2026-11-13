@@ -3151,6 +3151,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"--split-act-type"}, "{none,f32,f16,bf16,q8_0}",
+        "activation compression type at cross-GPU layer-split boundaries (default: none / f32; "
+        "f16/bf16 halve PCIe transfers, q8_0 cuts transfers by ~3.76x)",
+        [](common_params & params, const std::string & value) {
+            std::string v = value;
+            for (char & c : v) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (v == "none" || v == "f32") {
+                params.split_act_type = GGML_TYPE_F32;
+            } else if (v == "f16") {
+                params.split_act_type = GGML_TYPE_F16;
+            } else if (v == "bf16") {
+                params.split_act_type = GGML_TYPE_BF16;
+            } else if (v == "q8_0") {
+                params.split_act_type = GGML_TYPE_Q8_0;
+            } else {
+                throw std::invalid_argument("invalid --split-act-type value '" + value + "': expected one of {none, f32, f16, bf16, q8_0}");
+            }
+        }
+    ).set_env("LLAMA_ARG_SPLIT_ACT_TYPE"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {
