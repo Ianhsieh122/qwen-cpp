@@ -1,6 +1,6 @@
 # Install pre-built binaries
 
-BeeLlama release binaries are published on the project's [releases page](https://github.com/Anbeeld/beellama.cpp/releases). The package-manager commands below install upstream `llama.cpp`, not BeeLlama, so they are not guaranteed to include Bee-specific features such as KVarN or adaptive DFlash control.
+qwen-cpp release binaries are published on the project's [releases page](https://github.com/Ianhsieh122/qwen-cpp/releases). The package-manager commands below install upstream `llama.cpp`, not `qwen-cpp`, so they do not include `qwen-cpp` Volta/PCIe optimizations or BeeLlama features such as KVarN.
 
 | Install via | Windows | Mac  | Linux |
 |-------------|---------|------|-------|

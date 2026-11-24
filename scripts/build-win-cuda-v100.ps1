@@ -90,7 +90,7 @@ $commonFlags = @(
 )
 
 Write-Host "========================================"
-Write-Host "BeeLlama.cpp Windows CUDA 12.9 sm_70 Build (V100)"
+Write-Host "qwen-cpp Windows CUDA 12.9 sm_70 Build (V100)"
 Write-Host "CUDA:    $cudaVer"
 Write-Host "Arch:    sm_$cudaArch"
 Write-Host "Repo:    $repoRoot"

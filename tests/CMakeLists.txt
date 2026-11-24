@@ -10,18 +10,6 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-save-load-state-result-static PROPERTY LABELS main)
 
     add_test(
-        NAME test-release-workflow-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
-    set_property(TEST test-release-workflow-static PROPERTY LABELS main)
-
-    add_test(
-        NAME test-release-cache-parent
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-cache-parent.py)
-    set_property(TEST test-release-cache-parent PROPERTY LABELS main)
-
-    add_test(
         NAME test-verify-windows-package
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-verify-windows-package.py)

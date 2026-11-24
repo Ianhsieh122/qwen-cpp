@@ -1,8 +1,8 @@
-# BeeLlama.cpp HTTP Server
+# qwen-cpp HTTP Server
 
-Fast, lightweight C/C++ HTTP server based on [httplib](https://github.com/yhirose/cpp-httplib), [nlohmann::json](https://github.com/nlohmann/json), and BeeLlama's upstream-compatible inference engine.
+Fast, lightweight C/C++ HTTP server based on [httplib](https://github.com/yhirose/cpp-httplib), [nlohmann::json](https://github.com/nlohmann/json), and `qwen-cpp` (forked from BeeLlama.cpp / llama.cpp).
 
-It provides LLM REST APIs and a web UI for local BeeLlama inference.
+It provides LLM REST APIs and a web UI for local inference.
 
 **Features:**
  * LLM inference of F16 and quantized models on GPU and CPU

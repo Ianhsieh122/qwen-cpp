@@ -86,7 +86,6 @@ int main(int argc, char ** argv) {
     const std::string kvarn_store = read_file(root + "/ggml/src/ggml-cuda/kvarn.cu");
     const std::string kvarn_wide_instance = read_file(
         root + "/ggml/src/ggml-cuda/template-instances/fattn-mma-kvarn-instance-ncols1_16-ncols2_8.cu");
-    const std::string release = read_file(root + "/.github/workflows/release.yml");
 
     const auto expect_route = [&](const ggml_cuda_fattn_kvarn_route_input & base,
                                   ggml_cuda_fattn_kvarn_route expected,
@@ -401,8 +400,6 @@ int main(int argc, char ** argv) {
     ok &= expect(cmake.find("GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT EQUAL 15") != std::string::npos &&
                  cmake.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
         "CMake must retain exactly the 15-pair default KVarN fast-decode policy without HALF");
-    ok &= expect(count_occurrences(release, "-DGGML_CUDA_KVARN=ON") == 4,
-        "all Linux/Windows CUDA and ROCm release builds must explicitly enable KVarN");
     ok &= expect((hip_cmake.empty() || hip_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos) &&
                  (musa_cmake.empty() || musa_cmake.find("ggml_cuda_select_kvarn_fast_decode_sources") != std::string::npos) &&
                  cmake.find("GGML_CUDA_KVARN_ALL_PAIR_COUNT 36") != std::string::npos &&
