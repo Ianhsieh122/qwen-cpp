@@ -593,24 +593,74 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
     build_rs_history(inp, ssm_states_all, hparams.n_embd_s(), n_written);
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
-    if (n_seq_tokens > 1) {
+    ggml_tensor * gdn_out = nullptr;
+    ggml_tensor * output  = nullptr;
+
+    if (!cparams.fused_gdn_ch && n_seq_tokens > K) {
+        const int64_t n_prefix = n_seq_tokens - K;
+        auto slice_tokens = [&](ggml_tensor * t, int64_t t_offset, int64_t t_count) -> ggml_tensor * {
+            return ggml_view_4d(ctx0, t,
+                t->ne[0], t->ne[1], t_count, t->ne[3],
+                t->nb[1], t->nb[2], t->nb[3],
+                (size_t) t_offset * t->nb[2]);
+        };
+
+        auto prefix_res = build_delta_net_chunking(
+            slice_tokens(q, 0, n_prefix),
+            slice_tokens(k, 0, n_prefix),
+            slice_tokens(v, 0, n_prefix),
+            slice_tokens(g, 0, n_prefix),
+            slice_tokens(b, 0, n_prefix),
+            s, il);
+
+        ggml_tensor * out_prefix = prefix_res.first;
+        ggml_tensor * state_mid  = prefix_res.second;
+
+        ggml_tensor * q_tail = slice_tokens(q, n_prefix, K);
+        ggml_tensor * k_tail = slice_tokens(k, n_prefix, K);
+        ggml_tensor * v_tail = slice_tokens(v, n_prefix, K);
+        ggml_tensor * g_tail = slice_tokens(g, n_prefix, K);
+        ggml_tensor * b_tail = slice_tokens(b, n_prefix, K);
+        if (n_seqs > 1) {
+            g_tail = ggml_cont(ctx0, g_tail);
+            b_tail = ggml_cont(ctx0, b_tail);
+        }
+
+        // state_mid is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+        gdn_out = ggml_gated_delta_net(ctx0, q_tail, k_tail, v_tail, g_tail, b_tail, state_mid, K);
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+
+        ggml_tensor * out_tail = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, K, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * K),
+            0);
+        output = ggml_concat(ctx0, out_prefix, out_tail, 2);
+        cb(output, "attn_output", il);
     } else {
-        res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+
+        output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
     }
 
-    const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
+    const int64_t attn_score_elems    = S_v * H_v * n_written * n_seqs;
+    const int64_t gdn_tokens          = (!cparams.fused_gdn_ch && n_seq_tokens > K) ? K : n_seq_tokens;
+    const int64_t gdn_score_elems     = S_v * H_v * gdn_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
-
-    ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
-        S_v, H_v, n_seq_tokens, n_seqs,
-        ggml_row_size(gdn_out->type, S_v),
-        ggml_row_size(gdn_out->type, S_v * H_v),
-        ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
-        0);
-    cb(output, "attn_output", il);
+    GGML_UNUSED(attn_score_elems);
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
@@ -621,7 +671,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         D, n_seqs, n_written,
         ggml_row_size(gdn_out->type, D),
         ggml_row_size(gdn_out->type, state_size_per_snap),
-        ggml_row_size(gdn_out->type, attn_score_elems));
+        ggml_row_size(gdn_out->type, gdn_score_elems));
 
     ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
         D, n_seqs, n_written,

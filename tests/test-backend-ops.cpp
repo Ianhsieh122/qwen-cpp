@@ -12153,6 +12153,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // Qwen 3.8 27B GQA=6 D=256 FP16 decode (fattn-vec GQA-6 Split-K) and MTP verify (nb=4, Volta ncols2=8 MMA)
+    for (int64_t kv : { 256, 512, 4096, 32768 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 4096, 1, true,  true, 0,  0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 4, true, false, 0,  0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
@@ -12330,6 +12338,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 6, 128, 64, 1, 3, false, false, /*K=*/5));
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
@@ -12337,6 +12346,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 16, 1, 5));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

@@ -64,7 +64,23 @@ def main() -> None:
 
     fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
     require(fattn, "gqa_ratio_eff=2", "fattn.cu Volta GQA routing comment should match effective 2-col tile")
-    require(fattn, "Q->ne[1] * gqa_ratio_eff < 32", "fattn.cu Volta m8n8k4 MMA gate must enforce >= 32 cols")
+    require(fattn, "volta_mma_gqa_eff < 32", "fattn.cu Volta m8n8k4 MMA gate must enforce >= 32 cols")
+    require(
+        fattn,
+        "DKQ == 256 && DV == 256 && gqa_ratio > 4 && Q->ne[1] <= 16",
+        "fattn.cu Volta MMA switch must enable padded ncols2=8 for D=256 GQA>4 small batches",
+    )
+
+    fattn_vec = (ROOT / "ggml/src/ggml-cuda/fattn-vec.cuh").read_text(encoding="utf-8")
+    require(fattn_vec, "flash_attn_ext_vec_gqa", "fattn-vec.cuh missing GQA-sharing Split-K decode kernel")
+    require(fattn_vec, "launch_fattn<D, 1, 6>", "fattn-vec.cuh missing D=256 GQA-6 launch_fattn dispatch")
+
+    gdn_cu = (ROOT / "ggml/src/ggml-cuda/gated_delta_net.cu").read_text(encoding="utf-8")
+    require(gdn_cu, "const int prefix_end = n_tokens > K", "gated_delta_net.cu missing prefix/tail snapshot loop split")
+    require(gdn_cu, "gated_delta_net_cuda<128, false, keep_rs_t, true>", "gated_delta_net.cu missing S_v=128 float4 vectorization")
+
+    delta_base = (ROOT / "src/models/delta-net-base.cpp").read_text(encoding="utf-8")
+    require(delta_base, "!cparams.fused_gdn_ch && n_seq_tokens > K", "delta-net-base.cpp missing chunked-prefix fallback under rollback")
 
     cuda_cu = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     require(cuda_cu, "static bool ggml_cuda_p2p_requested()", "ggml-cuda.cu must provide ggml_cuda_p2p_requested()")

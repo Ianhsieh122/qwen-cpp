@@ -224,7 +224,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
-        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+        if (use_gqa_opt && (gqa_ratio % 8 == 0 || (DKQ == 256 && DV == 256 && gqa_ratio > 4 && Q->ne[1] <= 16))) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
         }
@@ -915,14 +915,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         // For Qwen3.8-27B Gated Attention (DKQ=256, DV=256, gqa_ratio=6 -> power-of-2 gqa_ratio_eff=2):
-        // Single-token decode (Q->ne[1] == 1) uses the vector kernel, while Volta's m8n8k4 MMA_F16 kernel
-        // requires ncols1 * ncols2 >= 32 (enforced via NO_DEVICE_CODE in fattn-mma-f16.cuh). Batches where
-        // Q->ne[1] * gqa_ratio_eff < 32 (including MTP verify ne[1]=4 with gqa_ratio_eff=2 -> 8) must stay
-        // on BEST_FATTN_KERNEL_TILE; note KVarN KV caches bypass this path on sm_70 via portable_native.
-        if (can_use_vector_kernel && Q->ne[1] == 1 && gqa_ratio_eff <= 2) {
+        // Single-token decode (Q->ne[1] == 1) uses the vector kernel (which shares KV across GQA=6 heads
+        // for F16 KV), while Volta's m8n8k4 MMA_F16 kernel requires ncols1 * ncols2 >= 32 (enforced via
+        // NO_DEVICE_CODE in fattn-mma-f16.cuh). For Q->ne[1] in [4..16], padded ncols2=8 lifts effective
+        // GQA columns to 8 so MTP verify (ne[1]=4 -> 4*8=32 cols) routes onto MMA_F16 instead of TILE.
+        const int volta_mma_gqa_eff =
+            (gqa_opt_applies && Q->ne[0] == 256 && gqa_ratio > 4 && Q->ne[1] <= 16) ? 8 : gqa_ratio_eff;
+        if (can_use_vector_kernel && Q->ne[1] == 1 &&
+                (gqa_ratio_eff <= 2 || (gqa_opt_applies && Q->ne[0] == 256 &&
+                 K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && gqa_ratio % 6 == 0))) {
             return BEST_FATTN_KERNEL_VEC;
         }
-        if (Q->ne[1] * gqa_ratio_eff < 32) {
+        if (Q->ne[1] * volta_mma_gqa_eff < 32) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster (and valid) for >= 32 cols.
         }
         return BEST_FATTN_KERNEL_MMA_F16;
