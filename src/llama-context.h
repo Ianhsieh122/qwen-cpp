@@ -91,6 +91,10 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    ggml_fp16_t * get_embeddings_nextn_f16();
+    ggml_fp16_t * get_embeddings_nextn_f16_ith(int32_t i);
+    bool          get_embeddings_nextn_fp16_enabled() const;
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -119,6 +123,8 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_nextn_fp16(bool value);
+    void set_embeddings_nextn_inp_f16(const ggml_fp16_t * data, int64_t n_rows);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -245,6 +251,9 @@ private:
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // ensure an on-device staging buffer exists for multi-ubatch h_nextn extraction
+    bool h_nextn_dev_alloc(ggml_backend_dev_t dev, ggml_type type, uint32_t n_embd, uint32_t n_rows);
+
     //
     // graph
     //
@@ -311,7 +320,9 @@ private:
     // hidden state required by the nextn layers (2-dimensional array: [n_outputs][n_embd])
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
-    buffer_view<float> embd_nextn = {nullptr, 0};
+    buffer_view<float>       embd_nextn     = {nullptr, 0};
+    buffer_view<ggml_fp16_t> embd_nextn_f16 = {nullptr, 0};
+    std::vector<float>       embd_nextn_f32_tmp;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
@@ -392,6 +403,12 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // on-device staging buffer for multi-ubatch h_nextn extraction
+    ggml_context_ptr        h_nextn_dev_ctx;
+    ggml_backend_buffer_ptr h_nextn_dev_buf;
+    ggml_tensor *           h_nextn_dev     = nullptr;
+    ggml_backend_dev_t      h_nextn_dev_dev = nullptr;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

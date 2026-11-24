@@ -35,6 +35,9 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    bool embeddings_nextn_fp16 = false; // extract t_h_nextn in F16 to halve PCIe transfer bandwidth
+    const ggml_fp16_t * embeddings_nextn_inp_f16 = nullptr; // optional external F16 hidden states for MTP draft decode
+    int64_t             embeddings_nextn_inp_f16_rows = 0;
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

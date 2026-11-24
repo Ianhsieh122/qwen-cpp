@@ -140,7 +140,7 @@ enum mmvq_parameter_table_id {
 // thread than the 2 rows of K-loop work a single row provides, so decode walks several
 // output rows at once and lets the loads interleave.
 #ifndef BEE_MMVQ_VOLTA_ROWS
-#define BEE_MMVQ_VOLTA_ROWS 2
+#define BEE_MMVQ_VOLTA_ROWS 1
 #endif
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -693,6 +693,101 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q4_K_q8_1_multi_vdr2(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs, const uint32_t stride_col_y, float * __restrict__ dots) {
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int i8         = (iqs/2) % 4;
+
+    const int * q4 = (const int *) (bq4_K->qs + 16 * bq8_offset + 4 * i8);
+    const int v0 = q4[0];
+    const int v1 = q4[4];
+
+    const int v0_lo = (v0 >> 0) & 0x0F0F0F0F;
+    const int v1_lo = (v1 >> 0) & 0x0F0F0F0F;
+    const int v0_hi = (v0 >> 4) & 0x0F0F0F0F;
+    const int v1_hi = (v1 >> 4) & 0x0F0F0F0F;
+
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    const int j  = bq8_offset / 2;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    const uint16_t aux0 = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    const uint16_t aux1 = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+
+    const float2 dm4f = __half22float2(bq4_K->dm);
+    const float d_sc0 =  dm4f.x * (float) (aux0 & 0xFF);
+    const float d_sc1 =  dm4f.x * (float) (aux0 >> 8);
+    const float d_m0  = -dm4f.y * (float) (aux1 & 0xFF);
+    const float d_m1  = -dm4f.y * (float) (aux1 >> 8);
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const block_q8_1 * bq8_c0 = bq8_1 + c * stride_col_y + bq8_offset;
+        const block_q8_1 * bq8_c1 = bq8_c0 + 1;
+        const float d0 = __low2float(bq8_c0->ds);
+        const float d1 = __low2float(bq8_c1->ds);
+
+        const int * q8_0 = (const int *) bq8_c0->qs + i8;
+        const int u00 = q8_0[0];
+        const int u01 = q8_0[4];
+        const int * q8_1 = (const int *) bq8_c1->qs + i8;
+        const int u10 = q8_1[0];
+        const int u11 = q8_1[4];
+
+        const int dot1_0 = ggml_cuda_dp4a(v1_lo, u01, ggml_cuda_dp4a(v0_lo, u00, 0));
+        const int dot2_0 = ggml_cuda_dp4a(0x01010101, u01, ggml_cuda_dp4a(0x01010101, u00, 0));
+        const int dot1_1 = ggml_cuda_dp4a(v1_hi, u11, ggml_cuda_dp4a(v0_hi, u10, 0));
+        const int dot2_1 = ggml_cuda_dp4a(0x01010101, u11, ggml_cuda_dp4a(0x01010101, u10, 0));
+
+        dots[c] = d0 * (d_sc0 * (float) dot1_0 + d_m0 * (float) dot2_0)
+                + d1 * (d_sc1 * (float) dot1_1 + d_m1 * (float) dot2_1);
+    }
+}
+
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q6_K_q8_1_multi_vdr1(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs, const uint32_t stride_col_y, float * __restrict__ dots) {
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    const int i8           = iqs % QI8_1;
+
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int v0 = __vsub4((((vl >> 0) & 0x0F0F0F0F) | (((vh >> 0) << 4) & 0x30303030)), 0x20202020);
+    const int v1 = __vsub4((((vl >> 4) & 0x0F0F0F0F) | (((vh >> 4) << 4) & 0x30303030)), 0x20202020);
+
+    const float d     = bq6_K->d;
+    const float d_sc0 = d * (float) bq6_K->scales[scale_offset + 0];
+    const float d_sc1 = d * (float) bq6_K->scales[scale_offset + 4];
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const block_q8_1 * bq8_c = bq8_1 + c * stride_col_y + bq8_offset;
+        const int u0   = get_int_b4(bq8_c[0].qs, i8);
+        const int u1   = get_int_b4(bq8_c[2].qs, i8);
+        const float d0 = __low2float(bq8_c[0].ds);
+        const float d1 = __low2float(bq8_c[2].ds);
+
+        const int dot0 = ggml_cuda_dp4a(v0, u0, 0);
+        const int dot1 = ggml_cuda_dp4a(v1, u1, 0);
+        dots[c] = (d_sc0 * d0) * (float) dot0 + (d_sc1 * d1) * (float) dot1;
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -715,7 +810,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    [[maybe_unused]] constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -813,7 +908,13 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_base = sample_x*stride_sample_x + channel_x*stride_channel_x;
+    int kbx_row_offsets[rows_per_cuda_block];
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+        const uint32_t r = (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x) ? uint32_t(row0 + i) : (nrows_x - 1);
+        kbx_row_offsets[i] = kbx_base + int(r) * int(stride_row_x);
+    }
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -829,13 +930,11 @@ static __global__ void mul_mat_vec_q(
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    if (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x) {
-                        const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                        mmvq_prefetch_l2((const char *) vx + off);
-                        if constexpr (has_fusion) {
-                            if (use_gate) {
-                                mmvq_prefetch_l2((const char *) vgate + off);
-                            }
+                    const size_t off = (size_t)(kbx_row_offsets[i] + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                    mmvq_prefetch_l2((const char *) vx + off);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            mmvq_prefetch_l2((const char *) vgate + off);
                         }
                     }
                 }
@@ -847,36 +946,65 @@ static __global__ void mul_mat_vec_q(
         if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                if (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x) {
-                    float dots[ncols_dst];
-                    vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, dots);
+                float dots[ncols_dst];
+                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, &y[kby], kbx_row_offsets[i] + kbx, kqs, stride_col_y, dots);
 #pragma unroll
-                    for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, stride_col_y, dots);
+                for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, &y[kby], kbx_row_offsets[i] + kbx, kqs, stride_col_y, dots);
 #pragma unroll
-                            for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
-                        }
+                        for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
                     }
                 }
             }
         } else
 #endif
-        {
-
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        if constexpr (type == GGML_TYPE_Q4_K && vdr == 2 && ncols_dst > 1 && ncols_dst <= 4) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                if (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x) {
-                    tmp[j][i] += vec_dot_q_cuda(
-                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            tmp_gate[j][i] += vec_dot_q_cuda(
-                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                        }
+                const int kbx_i = kbx_row_offsets[i] + kbx;
+                float dots[ncols_dst];
+                vec_dot_q4_K_q8_1_multi_vdr2<ncols_dst>(vx, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_q4_K_q8_1_multi_vdr2<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
+                    }
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q6_K && vdr == 1 && ncols_dst > 1 && ncols_dst <= 4) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int kbx_i = kbx_row_offsets[i] + kbx;
+                float dots[ncols_dst];
+                vec_dot_q6_K_q8_1_multi_vdr1<ncols_dst>(vx, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_q6_K_q8_1_multi_vdr1<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
+                    }
+                }
+            }
+        } else {
+
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            const int kbx_i = kbx_row_offsets[i] + kbx;
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                tmp[j][i] += vec_dot_q_cuda(
+                    vx, &y[j*stride_col_y + kby], kbx_i, kqs);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[j][i] += vec_dot_q_cuda(
+                            vgate, &y[j*stride_col_y + kby], kbx_i, kqs);
                     }
                 }
             }
@@ -997,7 +1125,7 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    [[maybe_unused]] constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {

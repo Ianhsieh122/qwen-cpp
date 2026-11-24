@@ -1471,6 +1471,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+    std::vector<ggml_fp16_t>        mtp_h_f16_buf;
+    std::vector<float>              mtp_h_f32_row;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1646,6 +1648,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const ggml_fp16_t * h_tgt_f16 = llama_get_embeddings_nextn_f16(ctx_tgt);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1657,18 +1660,71 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const bool use_h_f16 = (h_tgt_f16 != nullptr && n_tokens >= 16);
+            if (use_h_f16) {
+                mtp_h_f16_buf.resize((size_t) n_tokens * n_embd);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+                int k = 0;
+                while (k < n_tokens) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+                    batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
 
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                    if (k == i_batch_beg[seq_id]) {
+                        ggml_fp32_to_fp16_row(pending_h[seq_id].data(),
+                                mtp_h_f16_buf.data() + (size_t) k * n_embd, n_embd);
+                        ++k;
+                    } else {
+                        int k_end = k + 1;
+                        while (k_end < n_tokens) {
+                            const llama_seq_id next_seq = batch_in.tokens[k_end].seq_id;
+                            if (k_end == i_batch_beg[next_seq]) {
+                                break;
+                            }
+                            batch.add(batch_in.tokens[k_end].id, batch_in.tokens[k_end].pos[0], next_seq, false);
+                            ++k_end;
+                        }
+                        const size_t span_rows = (size_t) (k_end - k);
+                        std::memcpy(mtp_h_f16_buf.data() + (size_t) k * n_embd,
+                                h_tgt_f16 + (size_t) (k - 1) * n_embd,
+                                span_rows * (size_t) n_embd * sizeof(ggml_fp16_t));
+                        k = k_end;
+                    }
+                }
 
-                const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
+                llama_set_embeddings_nextn_inp_f16(ctx_dft, mtp_h_f16_buf.data(), n_tokens);
+            } else if (h_tgt_f16 != nullptr) {
+                // Keep short decode-verify batches on the F32 input path so ctx_dft's graph
+                // signature matches draft() and preserves CUDA graph reuse on the draft GPU.
+                mtp_h_f32_row.resize((size_t) n_embd);
 
-                batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+                    const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+
+                    const float * h_row = nullptr;
+                    if (k == i_batch_beg[seq_id]) {
+                        h_row = pending_h[seq_id].data();
+                    } else {
+                        ggml_fp16_to_fp32_row(h_tgt_f16 + (size_t) (k - 1) * n_embd, mtp_h_f32_row.data(), n_embd);
+                        h_row = mtp_h_f32_row.data();
+                    }
+
+                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                }
+            } else {
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+
+                    const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+
+                    const float * h_row = k == i_batch_beg[seq_id]
+                        ? pending_h[seq_id].data()
+                        : h_tgt + (size_t) (k - 1) * n_embd;
+
+                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1695,6 +1751,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            if (use_h_f16) {
+                llama_set_embeddings_nextn_inp_f16(ctx_dft, nullptr, 0);
+            }
+
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
@@ -1708,17 +1768,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            // verify_h is only indexed by accept() up to n_accepted <= n_max (at most n_max + 1 rows);
+            // capping to the trailing window avoids copying tens of MB during prompt prefill.
+            const int32_t total_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t keep_rows  = std::min<int32_t>(total_rows, std::max<int32_t>(1, this->params.n_max + 1));
+            const int32_t start_idx  = i_batch_end[seq_id] - keep_rows + 1;
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            verify_h_rows[seq_id] = keep_rows;
+            verify_h[seq_id].resize((size_t) keep_rows * n_embd);
+
+            if (h_tgt_f16 != nullptr) {
+                for (int32_t i = 0; i < keep_rows; ++i) {
+                    const ggml_fp16_t * h = llama_get_embeddings_nextn_f16_ith(ctx_tgt, start_idx + i);
+                    ggml_fp16_to_fp32_row(h, verify_h[seq_id].data() + (size_t) i * n_embd, n_embd);
+                }
+            } else {
+                for (int32_t i = 0; i < keep_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, start_idx + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (keep_rows - 1) * n_embd, row_bytes);
         }
 
         return true;
@@ -2770,7 +2842,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
-    result.n_ubatch = params_spec.n_ubatch > 0 ? params_spec.n_ubatch : 128;
+    const bool has_mtp = std::any_of(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    } else if (has_mtp) {
+        result.n_ubatch = std::max<int32_t>(128, std::min<int32_t>(params.n_ubatch, 512));
+    } else {
+        result.n_ubatch = 128;
+    }
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;

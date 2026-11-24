@@ -537,6 +537,36 @@ static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, h
     const uint32_t q1 = *reinterpret_cast<const uint32_t *>(q_ptr + 4);
 
     uint4 o;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    // Volta/post-Volta fast in-register 4-bit nibble -> half2 dequantizer using
+    // prmt.b32 (__byte_perm) + lop3.b32 with IEEE-754 FP16 magic constant 0x64006400u (1024.0h).
+    const uint32_t s0 = q0 >> shift;
+    const uint32_t s1 = q1 >> shift;
+    const uint32_t magic = 0x64006400u;
+
+    uint32_t p0 = __byte_perm(s0, magic, 0x7170);
+    uint32_t p1 = __byte_perm(s0, magic, 0x7372);
+    uint32_t p2 = __byte_perm(s1, magic, 0x7170);
+    uint32_t p3 = __byte_perm(s1, magic, 0x7372);
+    asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p0));
+    asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p1));
+    asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p2));
+    asm("lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;" : "+r"(p3));
+
+    const half2 neg_1024 = __float2half2_rn(-1024.0f);
+    const half2 d_h2     = __float2half2_rn(d);
+    const half2 neg_m_h2 = __float2half2_rn(-min_val);
+
+    const half2 h0 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p0), neg_1024), neg_m_h2);
+    const half2 h1 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p1), neg_1024), neg_m_h2);
+    const half2 h2 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p2), neg_1024), neg_m_h2);
+    const half2 h3 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p3), neg_1024), neg_m_h2);
+
+    o.x = reinterpret_cast<const uint32_t &>(h0);
+    o.y = reinterpret_cast<const uint32_t &>(h1);
+    o.z = reinterpret_cast<const uint32_t &>(h2);
+    o.w = reinterpret_cast<const uint32_t &>(h3);
+#else
     o.x = dequant_pack_half2(d * (float)((q0 >> (shift +  0)) & 0x0F) - min_val,
                              d * (float)((q0 >> (shift +  8)) & 0x0F) - min_val);
     o.y = dequant_pack_half2(d * (float)((q0 >> (shift + 16)) & 0x0F) - min_val,
@@ -545,6 +575,7 @@ static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, h
                              d * (float)((q1 >> (shift +  8)) & 0x0F) - min_val);
     o.w = dequant_pack_half2(d * (float)((q1 >> (shift + 16)) & 0x0F) - min_val,
                              d * (float)((q1 >> (shift + 24)) & 0x0F) - min_val);
+#endif
 
     *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
 }

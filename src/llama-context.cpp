@@ -443,6 +443,17 @@ llama_context::llama_context(
         LLAMA_LOG_INFO("%s: cross-GPU layer-split activation compression enabled (%s)\n",
                 __func__, ggml_type_name(cparams.split_act_type));
     }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch == LLM_ARCH_QWEN35) {
+        const char * env_mtp_h_fp16 = std::getenv("LLAMA_MTP_H_FP16");
+        if (env_mtp_h_fp16 != nullptr) {
+            cparams.embeddings_nextn_fp16 = (std::strcmp(env_mtp_h_fp16, "0") != 0);
+        } else {
+            cparams.embeddings_nextn_fp16 = (cparams.split_act_type != GGML_TYPE_F32);
+        }
+        if (cparams.embeddings_nextn_fp16) {
+            LLAMA_LOG_INFO("%s: MTP h_nextn FP16 staging enabled\n", __func__);
+        }
+    }
     bool tail_request_resolved = false;
     if (params.kv_tail_request && params.kv_tail_config) {
         throw std::invalid_argument("KV tail request and model-bound config are mutually exclusive");
@@ -1278,8 +1289,18 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
-    // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+    // reserve again with pp graph to avoid ggml-alloc reallocations during inference.
+    // When backend sampling is active with n_outputs_pp > n_seqs (e.g. speculative/MTP),
+    // prompt-prefill ubatches have n_outputs == 0 and emit the 1-row/seq dummy sampler
+    // graph; priming the final allocation table with n_outputs = n_seqs keeps the exact
+    // node topology and worst-case n_kv (attn_inp_kq_mask) size_max intact across all
+    // pipelined prompt ubatches while retaining the Step-1 buffer capacity for n_outputs_pp.
     {
+        const uint32_t n_outputs_pp_final =
+            (cparams.embeddings && (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN || cparams.pooling_type == LLAMA_POOLING_TYPE_RANK))
+            ? n_outputs_pp
+            : std::min(n_outputs_pp, n_seqs);
+
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
         ggml_cgraph * gf = nullptr;
@@ -1289,10 +1310,10 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, 1,      n_outputs_pp_final, mctx.get(), model.hparams.no_alloc);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp_final, mctx.get(), model.hparams.no_alloc);
         };
 
         if (!gf) {
@@ -1642,6 +1663,12 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
 
+    if (embd_nextn.data == nullptr && embd_nextn_f16.data != nullptr) {
+        embd_nextn_f32_tmp.resize(embd_nextn_f16.size);
+        ggml_fp16_to_fp32_row(embd_nextn_f16.data, embd_nextn_f32_tmp.data(), (int64_t) embd_nextn_f16.size);
+        return embd_nextn_f32_tmp.data();
+    }
+
     return embd_nextn.data;
 }
 
@@ -1649,11 +1676,21 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
     try {
+        const uint32_t n_embd = model.hparams.n_embd_out();
+
+        if (embd_nextn.data == nullptr && embd_nextn_f16.data != nullptr) {
+            const ggml_fp16_t * row_f16 = get_embeddings_nextn_f16_ith(i);
+            if (row_f16 == nullptr) {
+                return nullptr;
+            }
+            embd_nextn_f32_tmp.resize(n_embd);
+            ggml_fp16_to_fp32_row(row_f16, embd_nextn_f32_tmp.data(), n_embd);
+            return embd_nextn_f32_tmp.data();
+        }
+
         if (embd_nextn.data == nullptr) {
             throw std::runtime_error("no nextn embeddings");
         }
-
-        const uint32_t n_embd = model.hparams.n_embd_out();
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position.
@@ -1673,6 +1710,45 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+ggml_fp16_t * llama_context::get_embeddings_nextn_f16() {
+    output_reorder();
+
+    return embd_nextn_f16.data;
+}
+
+ggml_fp16_t * llama_context::get_embeddings_nextn_f16_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (embd_nextn_f16.data == nullptr) {
+            throw std::runtime_error("no nextn f16 embeddings");
+        }
+
+        const uint32_t n_embd = model.hparams.n_embd_out();
+
+        if (!cparams.embeddings_nextn_masked) {
+            if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn_f16.size) {
+                throw std::runtime_error(format("out of range [0, %zu)", embd_nextn_f16.size / n_embd));
+            }
+            return embd_nextn_f16.data + (size_t) i * n_embd;
+        }
+
+        const int64_t j = output_resolve_row(i);
+        return embd_nextn_f16.data + j * n_embd;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid nextn f16 embeddings id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
+bool llama_context::get_embeddings_nextn_fp16_enabled() const {
+    return cparams.embeddings_nextn_fp16;
 }
 
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
@@ -1868,6 +1944,16 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+void llama_context::set_embeddings_nextn_fp16(bool value) {
+    const bool allow = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch == LLM_ARCH_QWEN35);
+    cparams.embeddings_nextn_fp16 = allow ? value : false;
+}
+
+void llama_context::set_embeddings_nextn_inp_f16(const ggml_fp16_t * data, int64_t n_rows) {
+    cparams.embeddings_nextn_inp_f16      = data;
+    cparams.embeddings_nextn_inp_f16_rows = data ? n_rows : 0;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -2267,13 +2353,19 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
 
     // extract nextn embeddings (hidden state before the final output norm)
-    if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
-        GGML_ASSERT(backend_h != nullptr);
-
+    if (t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         const uint32_t n_embd = hparams.n_embd_out();
-        GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
-        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
+        if (t_h_nextn->type == GGML_TYPE_F16 && embd_nextn_f16.data) {
+            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+            GGML_ASSERT(backend_h != nullptr);
+            GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn_f16.size);
+            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_f16.data, 0, n_tokens*n_embd*sizeof(ggml_fp16_t));
+        } else if (t_h_nextn->type == GGML_TYPE_F32 && embd_nextn.data) {
+            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+            GGML_ASSERT(backend_h != nullptr);
+            GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
+            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
+        }
     }
 
     // TODO: hacky solution
@@ -2523,6 +2615,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    ggml_backend_t h_nextn_staged_backend = nullptr;
+    int64_t        h_nextn_staged_rows    = 0;
+    ggml_type      h_nextn_staged_type    = GGML_TYPE_COUNT;
+
     bool has_next_ubatch = false;
 
     do {
@@ -2677,16 +2773,73 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
-                GGML_ASSERT(backend_h != nullptr);
+            if (t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                const uint32_t n_embd = hparams.n_embd_out();
+                const bool want_f16 = (t_h_nextn->type == GGML_TYPE_F16 && embd_nextn_f16.data != nullptr);
+                const bool want_f32 = (t_h_nextn->type == GGML_TYPE_F32 && embd_nextn.data != nullptr);
+                if (want_f16 || want_f32) {
+                    ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                    GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+                    const size_t elem_size = want_f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+                    const size_t nbytes    = (size_t) n_rows * n_embd * elem_size;
+                    if (want_f16) {
+                        GGML_ASSERT((offset + n_rows) * n_embd <= (int64_t) embd_nextn_f16.size);
+                    } else {
+                        GGML_ASSERT((offset + n_rows) * n_embd <= (int64_t) embd_nextn.size);
+                    }
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
-                extract_all_idxs = extract_all_idxs || !masked;
+                    // For multi-ubatch batches (prompt prefill), stage t_h_nextn into an on-device buffer
+                    // via fast D2D copy and issue a single contiguous D2H transfer after the ubatch loop
+                    // to avoid stalling the multi-GPU pipeline on PCIe every ubatch.
+                    const bool multi_ubatch = n_tokens_all > (int64_t) cparams.n_ubatch;
+                    const int64_t total_rows_cap = masked ? n_outputs_all : n_tokens_all;
+                    bool staged = false;
+                    if (multi_ubatch &&
+                        ggml_is_contiguous(t_h_nextn) &&
+                        ggml_nbytes(t_h_nextn) == nbytes &&
+                        offset == h_nextn_staged_rows &&
+                        (h_nextn_staged_backend == nullptr || h_nextn_staged_backend == backend_h) &&
+                        (h_nextn_staged_type == GGML_TYPE_COUNT || h_nextn_staged_type == t_h_nextn->type) &&
+                        h_nextn_dev_alloc(ggml_backend_get_device(backend_h), t_h_nextn->type, n_embd,
+                                (uint32_t) std::max<int64_t>(total_rows_cap, cparams.n_batch))) {
+                        ggml_tensor dst_slice = *t_h_nextn;
+                        dst_slice.buffer    = nullptr;
+                        dst_slice.view_src  = h_nextn_dev;
+                        dst_slice.view_offs = (size_t) offset * n_embd * elem_size;
+                        dst_slice.data      = (char *) h_nextn_dev->data + dst_slice.view_offs;
+
+                        ggml_backend_tensor_copy_async(backend_h, backend_h, t_h_nextn, &dst_slice);
+                        h_nextn_staged_backend = backend_h;
+                        h_nextn_staged_rows    = offset + n_rows;
+                        h_nextn_staged_type    = t_h_nextn->type;
+                        staged = true;
+                    }
+
+                    if (!staged) {
+                        if (h_nextn_staged_rows > 0) {
+                            if (h_nextn_staged_type == GGML_TYPE_F16 && embd_nextn_f16.data) {
+                                ggml_backend_tensor_get_async(h_nextn_staged_backend, h_nextn_dev, embd_nextn_f16.data, 0,
+                                        (size_t) h_nextn_staged_rows * n_embd * sizeof(ggml_fp16_t));
+                            } else if (h_nextn_staged_type == GGML_TYPE_F32 && embd_nextn.data) {
+                                ggml_backend_tensor_get_async(h_nextn_staged_backend, h_nextn_dev, embd_nextn.data, 0,
+                                        (size_t) h_nextn_staged_rows * n_embd * sizeof(float));
+                            }
+                            h_nextn_staged_rows    = 0;
+                            h_nextn_staged_backend = nullptr;
+                            h_nextn_staged_type    = GGML_TYPE_COUNT;
+                        }
+                        if (want_f16) {
+                            ggml_fp16_t * embd_nextn_out = embd_nextn_f16.data + offset * n_embd;
+                            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, nbytes);
+                        } else {
+                            float * embd_nextn_out = embd_nextn.data + offset * n_embd;
+                            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, nbytes);
+                        }
+                    }
+
+                    extract_all_idxs = extract_all_idxs || !masked;
+                }
             }
         }
 
@@ -2718,6 +2871,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             synchronize();
         }
     } while (has_next_ubatch);
+
+    if (h_nextn_staged_rows > 0) {
+        const uint32_t n_embd = hparams.n_embd_out();
+        if (h_nextn_staged_type == GGML_TYPE_F16 && embd_nextn_f16.data) {
+            GGML_ASSERT(h_nextn_staged_rows * n_embd <= (int64_t) embd_nextn_f16.size);
+            ggml_backend_tensor_get_async(h_nextn_staged_backend, h_nextn_dev, embd_nextn_f16.data, 0,
+                    (size_t) h_nextn_staged_rows * n_embd * sizeof(ggml_fp16_t));
+        } else if (h_nextn_staged_type == GGML_TYPE_F32 && embd_nextn.data) {
+            GGML_ASSERT(h_nextn_staged_rows * n_embd <= (int64_t) embd_nextn.size);
+            ggml_backend_tensor_get_async(h_nextn_staged_backend, h_nextn_dev, embd_nextn.data, 0,
+                    (size_t) h_nextn_staged_rows * n_embd * sizeof(float));
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2806,12 +2972,19 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
-    embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
+    size_t nextn_elems = has_embd_nextn ? n_embd_out*n_outputs_max : 0;
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        nextn_elems = (size_t) n_embd_out * n_batch;
+    }
+    if (has_embd_nextn && cparams.embeddings_nextn_fp16) {
+        embd_nextn.size     = 0;
+        embd_nextn_f16.size = nextn_elems;
+    } else {
+        embd_nextn.size     = nextn_elems;
+        embd_nextn_f16.size = 0;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2832,9 +3005,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         output_ids.resize(n_batch);
     }
 
+    const size_t embd_nextn_f16_bytes = (embd_nextn_f16.size * sizeof(ggml_fp16_t) + 15) & ~size_t(15);
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        embd_nextn_f16_bytes +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2852,6 +3027,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
+            embd_nextn_f16.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
             }
@@ -2883,8 +3059,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
 
-    embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
+    embd_nextn = (has_embd_nextn && embd_nextn.size > 0) ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+
+    embd_nextn_f16 = (has_embd_nextn && embd_nextn_f16.size > 0) ? buffer_view<ggml_fp16_t>{(ggml_fp16_t *) (base + offset), embd_nextn_f16.size} : buffer_view<ggml_fp16_t>{nullptr, 0};
+    offset += embd_nextn_f16_bytes;
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -2939,6 +3118,61 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
 
     return n_outputs_max;
+}
+
+bool llama_context::h_nextn_dev_alloc(ggml_backend_dev_t dev, ggml_type type, uint32_t n_embd, uint32_t n_rows) {
+    if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+
+    if (h_nextn_dev &&
+        h_nextn_dev_dev == dev &&
+        h_nextn_dev->type == type &&
+        h_nextn_dev->ne[0] == (int64_t) n_embd &&
+        h_nextn_dev->ne[1] >= (int64_t) n_rows) {
+        return true;
+    }
+
+    if (h_nextn_dev_buf) {
+        synchronize();
+        h_nextn_dev     = nullptr;
+        h_nextn_dev_dev = nullptr;
+        h_nextn_dev_buf.reset();
+        h_nextn_dev_ctx.reset();
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft) {
+        return false;
+    }
+
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 2,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), type, n_embd, n_rows);
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate %s h_nextn staging buffer (%.2f MiB); falling back to per-ubatch D2H\n",
+                __func__, ggml_backend_dev_name(dev), ggml_nbytes(t) / (1024.0 * 1024.0));
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: %10s h_nextn buffer size = %8.2f MiB (%s)\n",
+            __func__, ggml_backend_dev_name(dev), ggml_backend_buffer_get_size(buf.get()) / (1024.0 * 1024.0),
+            ggml_type_name(type));
+
+    h_nextn_dev_ctx = std::move(ctx);
+    h_nextn_dev_buf = std::move(buf);
+    h_nextn_dev     = t;
+    h_nextn_dev_dev = dev;
+    return true;
 }
 
 bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
@@ -3001,6 +3235,12 @@ void llama_context::output_reorder() {
             }
         }
 
+        if (embd_nextn_f16.size > 0 && cparams.embeddings_nextn_masked) {
+            for (uint64_t k = 0; k < n_embd_out; k++) {
+                std::swap(embd_nextn_f16.data[i0*n_embd_out + k], embd_nextn_f16.data[i1*n_embd_out + k]);
+            }
+        }
+
         if (!sampling.samplers.empty()) {
             assert(sampling.logits.size > 0);
             assert(sampling.probs.size > 0);
@@ -3040,6 +3280,11 @@ void llama_context::output_reorder() {
             if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
                 for (size_t k = 0; k < n_embd_out; ++k) {
                     std::swap(embd_nextn.data[i*n_embd_out + k], embd_nextn.data[j*n_embd_out + k]);
+                }
+            }
+            if (embd_nextn_f16.has_data() && !cparams.embeddings_nextn_masked) {
+                for (size_t k = 0; k < n_embd_out; ++k) {
+                    std::swap(embd_nextn_f16.data[i*n_embd_out + k], embd_nextn_f16.data[j*n_embd_out + k]);
                 }
             }
             for (auto & layer : embd_layer_inp) {
@@ -3346,7 +3591,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     }
                 }
             }
-        } else if (strcmp(name, "split_decompress") == 0) {
+        } else if (strcmp(name, "split_decompress") == 0 || strcmp(name, "h_nextn_f16") == 0) {
             const auto & dev_target = (il >= 0) ? model.dev_layer(il) : model.dev_output();
             for (const auto & backend : backends) {
                 if (ggml_backend_get_device(backend.get()) == dev_target &&
@@ -5164,6 +5409,18 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
+void llama_set_embeddings_nextn_fp16(llama_context * ctx, bool value) {
+    ctx->set_embeddings_nextn_fp16(value);
+}
+
+bool llama_get_embeddings_nextn_fp16_enabled(const llama_context * ctx) {
+    return ctx->get_embeddings_nextn_fp16_enabled();
+}
+
+void llama_set_embeddings_nextn_inp_f16(llama_context * ctx, const ggml_fp16_t * data, int64_t n_rows) {
+    ctx->set_embeddings_nextn_inp_f16(data, n_rows);
+}
+
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
 }
@@ -5190,6 +5447,18 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+ggml_fp16_t * llama_get_embeddings_nextn_f16(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_nextn_f16();
+}
+
+ggml_fp16_t * llama_get_embeddings_nextn_f16_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_nextn_f16_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

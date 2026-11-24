@@ -97,6 +97,17 @@ LLAMA_API llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_con
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Enable or query FP16 staging for NextN hidden states (halves PCIe D2H/H2D bandwidth
+// when target and MTP draft contexts live on separate devices).
+LLAMA_API void          llama_set_embeddings_nextn_fp16(struct llama_context * ctx, bool value);
+LLAMA_API bool          llama_get_embeddings_nextn_fp16_enabled(const struct llama_context * ctx);
+LLAMA_API ggml_fp16_t * llama_get_embeddings_nextn_f16(struct llama_context * ctx);
+LLAMA_API ggml_fp16_t * llama_get_embeddings_nextn_f16_ith(struct llama_context * ctx, int32_t i);
+
+// Supply external FP16 hidden-state rows for an MTP draft context's decode call.
+// Pass data == nullptr to restore standard F32 ubatch.embd input.
+LLAMA_API void          llama_set_embeddings_nextn_inp_f16(struct llama_context * ctx, const ggml_fp16_t * data, int64_t n_rows);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

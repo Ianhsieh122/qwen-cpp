@@ -235,6 +235,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
+    const bool gather_before_norm = !cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids != nullptr;
+    if (gather_before_norm) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     if (n_layer > 0) {
         cur = maybe_compress_boundary(cur, model.dev_layer(n_layer - 1), model.dev_output(), n_layer - 1, -1);
     }
@@ -242,9 +247,16 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+    ggml_tensor * h_nextn = cur;
+    if (cparams.embeddings_nextn && cparams.embeddings_nextn_fp16) {
+        h_nextn = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        ggml_set_output(h_nextn);
+        cb(h_nextn, "h_nextn_f16", -1);
+        ggml_build_forward_expand(gf, h_nextn);
+    }
+    res->t_h_nextn = h_nextn;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (!gather_before_norm && !cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
@@ -550,7 +562,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd, &cparams);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
@@ -572,11 +584,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    const bool h_is_fp16 = (cparams.embeddings_nextn_inp_f16 != nullptr && ubatch.embd == nullptr);
+    inp->h = ggml_new_tensor_2d(ctx0, h_is_fp16 ? GGML_TYPE_F16 : GGML_TYPE_F32, hparams.n_embd, n_tokens);
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * h_embd = inp->h;
+    ggml_tensor * h_embd = h_is_fp16 ? ggml_cast(ctx0, inp->h, GGML_TYPE_F32) : inp->h;
 
     res->add_input(std::move(inp));
 

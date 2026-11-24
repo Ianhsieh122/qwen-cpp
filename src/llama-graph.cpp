@@ -215,13 +215,47 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ubatch->embd);
         GGML_ASSERT(n_embd == embd->ne[0]);
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    if (h && h->type == GGML_TYPE_F16 && cparams && cparams->embeddings_nextn_inp_f16) {
+        GGML_ASSERT(n_embd == h->ne[0]);
+
+        const ggml_fp16_t * src_f16 = cparams->embeddings_nextn_inp_f16;
+        const int64_t       src_rows = cparams->embeddings_nextn_inp_f16_rows;
+
+        if (ubatch->data && ubatch->data->batch_idxs.size() == (size_t) n_tokens) {
+            const auto & batch_idxs = ubatch->data->batch_idxs;
+            bool contiguous = true;
+            const int32_t base_idx = batch_idxs[0];
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                if (batch_idxs[i] != base_idx + i) {
+                    contiguous = false;
+                    break;
+                }
+            }
+            if (contiguous) {
+                GGML_ASSERT(base_idx >= 0 && base_idx + n_tokens <= src_rows);
+                ggml_backend_tensor_set(h, src_f16 + (size_t) base_idx * n_embd, 0, n_tokens * n_embd * sizeof(ggml_fp16_t));
+            } else {
+                std::vector<ggml_fp16_t> gathered((size_t) n_tokens * n_embd);
+                for (int64_t i = 0; i < n_tokens; ++i) {
+                    const int32_t bi = batch_idxs[i];
+                    GGML_ASSERT(bi >= 0 && bi < src_rows);
+                    std::memcpy(gathered.data() + (size_t) i * n_embd,
+                                src_f16 + (size_t) bi * n_embd,
+                                (size_t) n_embd * sizeof(ggml_fp16_t));
+                }
+                ggml_backend_tensor_set(h, gathered.data(), 0, gathered.size() * sizeof(ggml_fp16_t));
+            }
+        } else {
+            GGML_ASSERT(n_tokens <= src_rows);
+            ggml_backend_tensor_set(h, src_f16, 0, n_tokens * n_embd * sizeof(ggml_fp16_t));
+        }
+    } else if (ubatch->embd) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
@@ -231,9 +265,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
+    const bool want_h_f16 = (params.cparams.embeddings_nextn_inp_f16 != nullptr && params.ubatch.embd == nullptr);
+
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !want_h_f16) || (h && h->ne[1] == params.ubatch.n_tokens);
+    res &= (!h) || (h->type == (want_h_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32));
 
     return res;
 }

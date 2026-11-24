@@ -127,6 +127,28 @@ def main() -> None:
         for needle in needles:
             require(text, needle, f"{rel} missing expected multi-V100 option/documentation: {needle}")
 
+    # Phase 2: 4-col/warp GDN + Volta sm_70 FP16 Tensor-Core chunked WY/UT GDN
+    gdn_cu = (ROOT / "ggml/src/ggml-cuda/gated_delta_net.cu").read_text(encoding="utf-8")
+    for needle in ("K_COLS_PER_WARP", "warp_reduce_sum<sub_warp>", "launch_gated_delta_net_volta_chunked", "GGML_CUDA_GDN_VOLTA_MMA"):
+        require(gdn_cu, needle, f"gated_delta_net.cu missing Phase 2 optimization: {needle}")
+    gdn_volta = (ROOT / "ggml/src/ggml-cuda/gated-delta-net-volta.cu").read_text(encoding="utf-8")
+    for needle in ("VOLTA_MMA_AVAILABLE", "get_half2(M_reg[m])", "gated_delta_net_volta_chunked_kernel"):
+        require(gdn_volta, needle, f"gated-delta-net-volta.cu missing expected Volta MMA chunked GDN code: {needle}")
+
+    # Phase 3: MTP FP16 h_nextn staging, on-device multi-ubatch staging, sched_reserve PP priming & capped verify_h copy
+    spec_cpp = (ROOT / "common/speculative.cpp").read_text(encoding="utf-8")
+    for needle in ("llama_get_embeddings_nextn_f16", "llama_set_embeddings_nextn_inp_f16", "keep_rows", "use_h_f16"):
+        require(spec_cpp, needle, f"speculative.cpp missing Phase 3 MTP optimization: {needle}")
+    for needle in ("LLAMA_MTP_H_FP16", "h_nextn_f16", "h_nextn_dev_alloc", "n_outputs_pp_final"):
+        require(ctx_cpp, needle, f"llama-context.cpp missing Phase 3 MTP optimization: {needle}")
+    require(graph_h, "embeddings_nextn_fp16", "llama-graph.h allow_reuse missing embeddings_nextn_fp16 check")
+
+    # Phase 4: Volta prmt/lop3 Q4_K f16 dequant, cuBLAS src1 F16 cache, chunked CUDA graphs, hoisted row-outer MMVQ
+    require(convert, "lop3.b32 %0, %0, 0x000f000f, 0x64006400, 0xea;", "convert.cu dequantize_block_q4_K_f16 missing Volta lop3 unpacker")
+    require(cuda_cu, "GGML_CUDA_CUBLAS_CACHE_SRC1", "ggml-cuda.cu missing cuBLAS src1 F16 cache")
+    require(cuda_cu, "GGML_CUDA_GRAPH_CHUNK_SIZE", "ggml-cuda.cu missing chunked CUDA graph support")
+    require(mmvq, "kbx_row_offsets[rows_per_cuda_block]", "mmvq.cu missing hoisted branchless row offsets for multi-col CSE")
+
 
 if __name__ == "__main__":
     main()

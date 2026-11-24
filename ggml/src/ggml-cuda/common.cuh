@@ -1347,16 +1347,21 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
+    struct chunk {
+        cudaGraph_t     graph    = nullptr;
+        cudaGraphExec_t instance = nullptr;
+    };
     ~ggml_cuda_graph() {
-        if (instance != nullptr) {
-            CUDA_CHECK(cudaGraphExecDestroy(instance));
-        }
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
+        for (auto & ch : chunks) {
+            if (ch.instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(ch.instance));
+            }
+            if (ch.graph != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(ch.graph));
+            }
         }
     }
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
+    std::vector<chunk> chunks;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1371,6 +1376,10 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+
+    bool has_instance() const {
+        return !chunks.empty() && chunks[0].instance != nullptr;
+    }
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1586,13 +1595,50 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const {
         for (const auto & [key, graph] : cuda_graphs) {
-            if (graph && graph->instance != nullptr) {
+            if (graph && graph->has_instance()) {
                 return true;
             }
         }
         return false;
     }
 #endif // USE_CUDA_GRAPH
+
+    // Per-stream cache for contiguous F32 -> F16 src1 conversions reused across sibling
+    // cuBLAS matmuls (e.g. wqkv/wqkv_gate/ssm_alpha/ssm_beta, wq/wk/wv, ffn_gate/ffn_up).
+    struct cublas_src1_f16_cache_entry {
+        const void * src_ptr       = nullptr;
+        int64_t      nelements     = 0;
+        void *       dev_buf       = nullptr;
+        size_t       dev_buf_bytes = 0;
+    };
+    cublas_src1_f16_cache_entry cublas_src1_f16_cache[GGML_CUDA_MAX_STREAMS];
+    bool is_capturing = false;
+
+    void invalidate_cublas_src1_f16_cache() {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            cublas_src1_f16_cache[s].src_ptr   = nullptr;
+            cublas_src1_f16_cache[s].nelements = 0;
+        }
+    }
+
+    void invalidate_cublas_src1_f16_cache_if_overlap(const void * dst_ptr, size_t dst_bytes) {
+        if (dst_ptr == nullptr || dst_bytes == 0) {
+            return;
+        }
+        const uintptr_t d_beg = (uintptr_t) dst_ptr;
+        const uintptr_t d_end = d_beg + dst_bytes;
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            auto & e = cublas_src1_f16_cache[s];
+            if (e.src_ptr != nullptr) {
+                const uintptr_t s_beg = (uintptr_t) e.src_ptr;
+                const uintptr_t s_end = s_beg + (size_t) e.nelements * sizeof(float);
+                if (d_beg < s_end && s_beg < d_end) {
+                    e.src_ptr   = nullptr;
+                    e.nelements = 0;
+                }
+            }
+        }
+    }
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),

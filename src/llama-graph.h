@@ -167,7 +167,8 @@ public:
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
-    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd) {}
+    llm_graph_input_embd_h(int64_t n_embd, const llama_cparams * cparams = nullptr)
+        : n_embd(n_embd), cparams(cparams) {}
     virtual ~llm_graph_input_embd_h() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -176,9 +177,10 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
-    ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * h      = nullptr; // F32 or F16 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+    const llama_cparams * cparams = nullptr;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -990,6 +992,8 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.embeddings_nextn_fp16   == other.cparams.embeddings_nextn_fp16   &&
+            (cparams.embeddings_nextn_inp_f16 != nullptr) == (other.cparams.embeddings_nextn_inp_f16 != nullptr) &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             cparams.split_act_type          == other.cparams.split_act_type          &&
             arch  == other.arch  &&

@@ -919,8 +919,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // for F16 KV), while Volta's m8n8k4 MMA_F16 kernel requires ncols1 * ncols2 >= 32 (enforced via
         // NO_DEVICE_CODE in fattn-mma-f16.cuh). For Q->ne[1] in [4..16], padded ncols2=8 lifts effective
         // GQA columns to 8 so MTP verify (ne[1]=4 -> 4*8=32 cols) routes onto MMA_F16 instead of TILE.
-        const int volta_mma_gqa_eff =
-            (gqa_opt_applies && Q->ne[0] == 256 && gqa_ratio > 4 && Q->ne[1] <= 16) ? 8 : gqa_ratio_eff;
+        const int volta_mma_gqa_eff = !gqa_opt_applies ? 1 :
+            ((Q->ne[0] == 256 && gqa_ratio > 4 && Q->ne[1] <= 16) ? 8 : gqa_ratio_eff);
         if (can_use_vector_kernel && Q->ne[1] == 1 &&
                 (gqa_ratio_eff <= 2 || (gqa_opt_applies && Q->ne[0] == 256 &&
                  K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && gqa_ratio % 6 == 0))) {
