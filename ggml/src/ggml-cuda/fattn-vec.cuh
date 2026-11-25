@@ -531,7 +531,55 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template<int D, int GQA, bool use_logit_softcap>
+template <ggml_type type_KV, int elems_per_lane>
+static __device__ __forceinline__ void flash_attn_vec_gqa_load_row(
+        const char * __restrict__ row_ptr,
+        const int lane,
+        float2 (&out)[elems_per_lane / 2]) {
+    constexpr int h2_per_lane = elems_per_lane / 2;
+    if constexpr (type_KV == GGML_TYPE_F16) {
+        static_assert(h2_per_lane % 4 == 0, "h2_per_lane must be a multiple of 4 for 16-byte loads");
+        __align__(16) half2 h2[h2_per_lane];
+        const half2 * ptr = (const half2 *) (row_ptr + lane * elems_per_lane * sizeof(half));
+#pragma unroll
+        for (int i = 0; i < h2_per_lane; i += 4) {
+            ggml_cuda_memcpy_1<16>(h2 + i, ptr + i);
+        }
+#pragma unroll
+        for (int i = 0; i < h2_per_lane; ++i) {
+            out[i] = __half22float2(h2[i]);
+        }
+    } else if constexpr (type_KV == GGML_TYPE_Q8_0) {
+        static_assert(elems_per_lane == 8, "Q8_0 GQA loader expects 8 elements per lane");
+        const block_q8_0 * blk = (const block_q8_0 *) row_ptr + (lane >> 2);
+        const int iqs = (lane & 3) * 8;
+        __align__(8) int8_t qs[8];
+        ggml_cuda_memcpy_1<8, 2>(qs, blk->qs + iqs);
+        const float d = __half2float(blk->d);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            out[i] = make_float2(d * (float) qs[2 * i + 0], d * (float) qs[2 * i + 1]);
+        }
+    } else if constexpr (type_KV == GGML_TYPE_Q4_0) {
+        static_assert(elems_per_lane == 8, "Q4_0 GQA loader expects 8 elements per lane");
+        const block_q4_0 * blk = (const block_q4_0 *) row_ptr + (lane >> 2);
+        const int iqs   = (lane & 1) * 8;
+        const int shift = ((lane >> 1) & 1) * 4;
+        __align__(8) uint8_t qs[8];
+        ggml_cuda_memcpy_1<8, 2>(qs, blk->qs + iqs);
+        const float d = __half2float(blk->d);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int q0 = ((qs[2 * i + 0] >> shift) & 0x0F) - 8;
+            const int q1 = ((qs[2 * i + 1] >> shift) & 0x0F) - 8;
+            out[i] = make_float2(d * (float) q0, d * (float) q1);
+        }
+    } else {
+        static_assert(type_KV == GGML_TYPE_F16, "unsupported KV type for flash_attn_vec_gqa_load_row");
+    }
+}
+
+template<int D, int GQA, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 __launch_bounds__(128, 2)
 static __global__ void flash_attn_ext_vec_gqa(
         const char * Q_ptr,
@@ -627,18 +675,8 @@ static __global__ void flash_attn_ext_vec_gqa(
             continue;
         }
 
-        __align__(16) half2 k_h2[h2_per_lane];
-        const half2 * K_row = (const half2 *) (K + int64_t(k) * nb11 + lane * elems_per_lane * sizeof(half));
-#pragma unroll
-        for (int i = 0; i < h2_per_lane; i += 4) {
-            ggml_cuda_memcpy_1<16>(k_h2 + i, K_row + i);
-        }
-
         float2 k_f2[h2_per_lane];
-#pragma unroll
-        for (int i = 0; i < h2_per_lane; ++i) {
-            k_f2[i] = __half22float2(k_h2[i]);
-        }
+        flash_attn_vec_gqa_load_row<type_K, elems_per_lane>(K + int64_t(k) * nb11, lane, k_f2);
 
         float old_scale[GQA];
         float weight[GQA];
@@ -665,18 +703,8 @@ static __global__ void flash_attn_ext_vec_gqa(
             weight[h]    = w;
         }
 
-        __align__(16) half2 v_h2[h2_per_lane];
-        const half2 * V_row = (const half2 *) (V + int64_t(k) * nb21 + lane * elems_per_lane * sizeof(half));
-#pragma unroll
-        for (int i = 0; i < h2_per_lane; i += 4) {
-            ggml_cuda_memcpy_1<16>(v_h2 + i, V_row + i);
-        }
-
         float2 v_f2[h2_per_lane];
-#pragma unroll
-        for (int i = 0; i < h2_per_lane; ++i) {
-            v_f2[i] = __half22float2(v_h2[i]);
-        }
+        flash_attn_vec_gqa_load_row<type_V, elems_per_lane>(V + int64_t(k) * nb21, lane, v_f2);
 
 #pragma unroll
         for (int h = 0; h < GQA; ++h) {
@@ -789,25 +817,31 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if constexpr (D == 256 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {
+    constexpr bool k_gqa_supported = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0;
+    constexpr bool v_gqa_supported = type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0;
+    if constexpr (D == 256 && k_gqa_supported && v_gqa_supported) {
         const ggml_tensor * K    = dst->src[1];
         const ggml_tensor * V    = dst->src[2];
         const ggml_tensor * mask = dst->src[3];
         float max_bias = 0.0f;
         memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
         const int gqa_ratio = Q->ne[2] / K->ne[2];
+        constexpr size_t k_align = type_K == GGML_TYPE_F16 ? 16 : 2;
+        constexpr size_t v_align = type_V == GGML_TYPE_F16 ? 16 : 2;
         if (Q->ne[1] == 1 && Q->ne[2] % K->ne[2] == 0 && gqa_ratio % 6 == 0 &&
                 max_bias == 0.0f && (!mask || mask->ne[2] == 1) &&
-                Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0 &&
-                K->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 &&
-                V->nb[1] % 16 == 0 && V->nb[2] % 16 == 0) {
+                reinterpret_cast<uintptr_t>(Q->data) % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(K->data) % k_align == 0 && K->nb[1] % k_align == 0 && K->nb[2] % k_align == 0 && K->nb[3] % k_align == 0 &&
+                reinterpret_cast<uintptr_t>(V->data) % v_align == 0 && V->nb[1] % v_align == 0 && V->nb[2] % v_align == 0 && V->nb[3] % v_align == 0) {
             constexpr int nwarps = 4;
             constexpr size_t nbytes_shared = 0;
             constexpr int nbatch_fa = 64;
+            const bool need_f16_K = type_K == GGML_TYPE_F16;
+            const bool need_f16_V = type_V == GGML_TYPE_F16;
             fattn_kernel_t fattn_kernel = logit_softcap == 0.0f ?
-                flash_attn_ext_vec_gqa<D, 6, false> :
-                flash_attn_ext_vec_gqa<D, 6, true>;
-            launch_fattn<D, 1, 6>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false);
+                flash_attn_ext_vec_gqa<D, 6, type_K, type_V, false> :
+                flash_attn_ext_vec_gqa<D, 6, type_K, type_V, true>;
+            launch_fattn<D, 1, 6>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16_K, need_f16_V, false, false);
             return;
         }
     }

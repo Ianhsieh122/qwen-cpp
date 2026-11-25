@@ -222,7 +222,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
-    // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
+    // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute.
+    // Note for D=256 GQA=6: fattn-mma-f16 caps ncols = ncols1 * ncols2 at 64. For small batches
+    // (Q->ne[1] <= 16), padded ncols2=8 reduces blocks/KV-head from 3 to 1..2 and lifts ne[1]=4
+    // to 32 cols. For prefill (Q->ne[1] >= 32), ncols2=2 (ncols1=32) packs 64 valid queries/block
+    // (0% waste, 96 blocks/KV-head at ub=1024), whereas padded ncols2=8 (ncols1=8) packs only
+    // 48 valid queries/block (128 blocks/KV-head -> +33% more K/V HBM reads and +33% more FLOPs).
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && (gqa_ratio % 8 == 0 || (DKQ == 256 && DV == 256 && gqa_ratio > 4 && Q->ne[1] <= 16))) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
@@ -921,9 +926,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // GQA columns to 8 so MTP verify (ne[1]=4 -> 4*8=32 cols) routes onto MMA_F16 instead of TILE.
         const int volta_mma_gqa_eff = !gqa_opt_applies ? 1 :
             ((Q->ne[0] == 256 && gqa_ratio > 4 && Q->ne[1] <= 16) ? 8 : gqa_ratio_eff);
+        const bool gqa6_vec_kv_supported =
+            (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
+            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
         if (can_use_vector_kernel && Q->ne[1] == 1 &&
                 (gqa_ratio_eff <= 2 || (gqa_opt_applies && Q->ne[0] == 256 &&
-                 K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && gqa_ratio % 6 == 0))) {
+                 gqa6_vec_kv_supported && gqa_ratio % 6 == 0))) {
             return BEST_FATTN_KERNEL_VEC;
         }
         if (Q->ne[1] * volta_mma_gqa_eff < 32) {

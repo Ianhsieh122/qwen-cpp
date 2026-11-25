@@ -1363,8 +1363,10 @@ void llama_context::sched_reserve() {
 
     const int64_t t_end_us = ggml_time_us();
 
-    LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
-            __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d, pipeline_parallel = %s\n",
+            __func__, (t_end_us - t_start_us)/1000.0,
+            ggml_backend_sched_get_n_copies(sched.get()),
+            cparams.pipeline_parallel ? "on" : "off");
 }
 
 void llama_context::record_backend_private_workspace(ggml_cgraph * gf) {

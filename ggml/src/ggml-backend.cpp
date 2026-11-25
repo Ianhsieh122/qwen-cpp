@@ -1881,6 +1881,16 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
 
+        if (sched->n_copies > 1 && sched->debug_prev_graph_size > 0) {
+            static int pipeline_realloc_warns = 0;
+            if (pipeline_realloc_warns < 8) {
+                pipeline_realloc_warns++;
+                GGML_LOG_WARN("%s: pipeline-parallel graph reallocation forced backend sync (backend_ids_changed = %d, nodes = %d, leafs = %d, prev_size = %d, cur_size = %d)\n",
+                        __func__, (int) backend_ids_changed, sched->graph.n_nodes, sched->graph.n_leafs,
+                        sched->debug_prev_graph_size, sched->debug_graph_size);
+            }
+        }
+
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
@@ -1954,6 +1964,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    if (input_backend != split_backend &&
+                        input_backend->iface.event_wait != NULL &&
+                        ggml_backend_dev_backend_reg(input_backend->device) == ggml_backend_dev_backend_reg(split_backend->device)) {
+                        ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    }
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
@@ -2140,7 +2155,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    int n_non_cpu_backends = 0;
+    for (int b = 0; b < n_backends; b++) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backends[b])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            n_non_cpu_backends++;
+        }
+    }
+    const int n_copies_parallel = std::max(2, std::min(n_non_cpu_backends, GGML_SCHED_MAX_COPIES));
+    sched->n_copies = parallel ? n_copies_parallel : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2272,6 +2294,23 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+
+    if (sched->n_copies > 1) {
+        // Ensure any prior ubatch that used sched->cur_copy has finished reading
+        // graph_inputs on their owning backends before the caller populates inputs
+        // via set_inputs(). Non-input-owning downstream GPUs are not waited on here,
+        // preserving full pipeline overlap across GPUs even with n_copies == 2.
+        bool synced[GGML_SCHED_MAX_BACKENDS] = {};
+        for (int i = 0; i < sched->n_graph_inputs; i++) {
+            const int backend_id = tensor_backend_id(sched->graph_inputs[i]);
+            if (backend_id >= 0 && backend_id < sched->n_backends && !synced[backend_id]) {
+                synced[backend_id] = true;
+                if (sched->events[backend_id][sched->cur_copy] != NULL) {
+                    ggml_backend_event_synchronize(sched->events[backend_id][sched->cur_copy]);
+                }
+            }
+        }
     }
 
     sched->is_alloc = true;

@@ -149,6 +149,25 @@ def main() -> None:
     require(cuda_cu, "GGML_CUDA_GRAPH_CHUNK_SIZE", "ggml-cuda.cu missing chunked CUDA graph support")
     require(mmvq, "kbx_row_offsets[rows_per_cuda_block]", "mmvq.cu missing hoisted branchless row offsets for multi-col CSE")
 
+    # Batch A: dynamic 2-copy pipeline_parallel + hazard guards, Q8_0/Q4_0 GQA-6 D=256 FA vec decode
+    backend_cpp = (ROOT / "ggml/src/ggml-backend.cpp").read_text(encoding="utf-8")
+    for needle in (
+        "n_copies_parallel = std::max(2, std::min(n_non_cpu_backends, GGML_SCHED_MAX_COPIES))",
+        "ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy])",
+        "pipeline-parallel graph reallocation forced backend sync",
+        "for (int i = 0; i < sched->n_graph_inputs; i++)",
+    ):
+        require(backend_cpp, needle, f"ggml-backend.cpp missing Batch A pipeline_parallel optimization/guard: {needle}")
+    require(ctx_cpp, "pipeline_parallel = %s", "llama-context.cpp missing pipeline_parallel status in sched_reserve log")
+    for needle in (
+        "flash_attn_vec_gqa_load_row",
+        "type_KV == GGML_TYPE_Q8_0",
+        "type_KV == GGML_TYPE_Q4_0",
+        "need_f16_K, need_f16_V",
+    ):
+        require(fattn_vec, needle, f"fattn-vec.cuh missing Batch A Q8_0/Q4_0 GQA-6 decode support: {needle}")
+    require(fattn, "gqa6_vec_kv_supported", "fattn.cu missing Q8_0/Q4_0 GQA-6 vector routing")
+
 
 if __name__ == "__main__":
     main()
