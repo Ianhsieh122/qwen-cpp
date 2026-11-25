@@ -62,7 +62,10 @@ jobs:
     name: Build Linux CUDA 12.9 .zip (Ubuntu 24.04)
     needs: resolve-tag
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout
@@ -98,9 +101,6 @@ jobs:
             ccache-cuda129-ubuntu2404-${{ env.CUDA_ARCHITECTURES }}-
 
       - name: Configure & build Linux CUDA release binaries
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/.ccache
-          CCACHE_MAXSIZE: 2G
         run: |
           ccache --zero-stats
           cmake -S . -B build-linux-cuda -G Ninja \
@@ -128,7 +128,7 @@ jobs:
             -DLLAMA_BUILD_TOOLS=ON \
             -DLLAMA_BUILD_TESTS=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF
-          cmake --build build-linux-cuda --parallel \
+          cmake --build build-linux-cuda --parallel 3 \
             --target llama-server llama-cli llama-bench llama-perplexity test-backend-ops
           ccache --show-stats
 
@@ -165,7 +165,10 @@ jobs:
     # Do NOT use windows-latest (VS 2026 / MSVC 14.5x breaks CUDA 12.9 nvcc,
     # and CUDA 13.x drops sm_70 Volta support).
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 180
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
+      SCCACHE_CACHE_SIZE: 3G
 
     steps:
       - name: Checkout
@@ -240,9 +243,6 @@ jobs:
 
       - name: Configure & build Windows CUDA release binaries
         shell: pwsh
-        env:
-          SCCACHE_DIR: ${{ github.workspace }}\.sccache
-          SCCACHE_CACHE_SIZE: 3G
         run: |
           $ErrorActionPreference = "Stop"
           $cudaRoot = $env:CUDA_PATH
@@ -274,7 +274,7 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & cmake --build build-win-cuda-v100 --parallel `
+          & cmake --build build-win-cuda-v100 --parallel 3 `
             --target llama-server llama-cli llama-bench llama-perplexity test-backend-ops
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
