@@ -1,0 +1,318 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+# Strictly read-only for public-repo safety (never grant contents: write in PR/branch CI).
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # IMPORTANT: Keep CUDA on 12.x (12.9). Do NOT bump to CUDA 13.x — CUDA 13.x
+  # dropped NVIDIA Volta (sm_70 / Tesla V100) support completely.
+  CUDA_VERSION: '12.9'
+  CUDA_ARCHITECTURES: '70;86'
+
+jobs:
+  static-and-cpu-tests:
+    name: Static & CPU Tests (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run V100 / PCIe static regression checks
+        run: python3 tests/test-v100-pcie-opts-static.py
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ccache
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-cpu-ubuntu2404-${{ hashFiles('CMakeLists.txt', 'ggml/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-cpu-ubuntu2404-${{ hashFiles('CMakeLists.txt', 'ggml/CMakeLists.txt') }}-
+            ccache-cpu-ubuntu2404-
+
+      - name: Configure & build CPU tests
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1G
+        run: |
+          ccache --zero-stats
+          cmake -S . -B build-cpu -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CCACHE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DGGML_NATIVE=OFF \
+            -DGGML_AVX2=ON \
+            -DGGML_FMA=ON \
+            -DGGML_F16C=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF
+          cmake --build build-cpu --parallel
+          ccache --show-stats
+
+      - name: Run CPU & static unit tests
+        run: |
+          ctest --test-dir build-cpu -L main --output-on-failure --timeout 180
+
+  build-linux-cuda:
+    name: Build Linux CUDA 12.9 sm_70;86 (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install minimal CUDA 12.9 toolkit & Ninja/ccache
+        run: |
+          # Keep CUDA on 12.9 (sm_70 Volta support was removed in CUDA 13.x).
+          curl -fsSL -o /tmp/cuda-keyring.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          rm -f /tmp/cuda-keyring.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build \
+            ccache \
+            cuda-nvcc-12-9 \
+            cuda-cudart-dev-12-9 \
+            libcublas-dev-12-9 \
+            cuda-cccl-12-9
+          echo "/usr/local/cuda-12.9/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda-12.9" >> "$GITHUB_ENV"
+          /usr/local/cuda-12.9/bin/nvcc --version
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-cuda129-ubuntu2404-${{ env.CUDA_ARCHITECTURES }}-${{ hashFiles('CMakeLists.txt', 'ggml/src/ggml-cuda/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-cuda129-ubuntu2404-${{ env.CUDA_ARCHITECTURES }}-${{ hashFiles('CMakeLists.txt', 'ggml/src/ggml-cuda/CMakeLists.txt') }}-
+            ccache-cuda129-ubuntu2404-${{ env.CUDA_ARCHITECTURES }}-
+
+      - name: Configure & build Linux CUDA targets
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 2G
+        run: |
+          ccache --zero-stats
+          cmake -S . -B build-linux-cuda -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_KVARN=ON \
+            -DGGML_CUDA_FA_ALL_QUANTS=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCHITECTURES }}" \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-12.9 \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+            -DGGML_CCACHE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DGGML_NATIVE=OFF \
+            -DGGML_AVX2=ON \
+            -DGGML_FMA=ON \
+            -DGGML_F16C=ON \
+            -DGGML_BACKEND_DL=OFF \
+            -DGGML_RPC=OFF \
+            -DLLAMA_BUILD_BORINGSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build-linux-cuda --parallel \
+            --target llama-server llama-cli llama-bench llama-perplexity test-backend-ops
+          ccache --show-stats
+
+  build-windows-cuda:
+    name: Build Windows CUDA 12.9 sm_70;86 (Windows 2022)
+    # Pinned to windows-2022 (Visual Studio 2022 / MSVC 14.4x).
+    # Do NOT use windows-latest (VS 2026 / MSVC 14.5x breaks CUDA 12.9 nvcc,
+    # and CUDA 13.x drops sm_70 Volta support).
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup MSVC 2022 (x64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Restore sccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: sccache-cuda129-win2022-${{ env.CUDA_ARCHITECTURES }}-${{ hashFiles('CMakeLists.txt', 'ggml/src/ggml-cuda/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            sccache-cuda129-win2022-${{ env.CUDA_ARCHITECTURES }}-${{ hashFiles('CMakeLists.txt', 'ggml/src/ggml-cuda/CMakeLists.txt') }}-
+            sccache-cuda129-win2022-${{ env.CUDA_ARCHITECTURES }}-
+
+      - name: Install minimal CUDA 12.9 toolkit (NVIDIA redist)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          # Keep CUDA on 12.9 (sm_70 Volta support was removed in CUDA 13.x).
+          $cudaRoot = "C:\cuda-12.9"
+          New-Item -ItemType Directory -Force -Path $cudaRoot | Out-Null
+
+          $redistBase = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $manifest = $null
+          foreach ($ver in @("12.9.1", "12.9.0")) {
+            try {
+              $manifest = Invoke-RestMethod -Uri "$redistBase/redistrib_$ver.json" -TimeoutSec 60
+              Write-Host "Using NVIDIA CUDA redist manifest $ver"
+              break
+            } catch {
+              Write-Host "Manifest $ver unavailable, trying next..."
+            }
+          }
+          if (-not $manifest) {
+            throw "Failed to fetch NVIDIA CUDA 12.9 redist manifest"
+          }
+
+          $required = @("cuda_nvcc", "cuda_cudart", "libcublas", "cuda_cccl")
+          $optional = @("cuda_crt", "cuda_nvtx", "cuda_profiler_api", "libnvvm")
+
+          foreach ($pkg in ($required + $optional)) {
+            $entry = $manifest.$pkg
+            if (-not $entry -or -not $entry.'windows-x86_64') {
+              if ($required -contains $pkg) {
+                throw "Required CUDA package '$pkg' missing from redist manifest"
+              }
+              continue
+            }
+            $relPath = $entry.'windows-x86_64'.relative_path
+            $url = "$redistBase/$relPath"
+            $zipFile = Join-Path $env:RUNNER_TEMP "$pkg.zip"
+            Write-Host "Downloading $pkg from $url"
+            & curl.exe -fsSL --retry 3 --retry-delay 5 -o $zipFile $url
+            if ($LASTEXITCODE -ne 0) { throw "Failed to download $pkg" }
+            & tar.exe -xf $zipFile -C $cudaRoot --strip-components=1
+            if ($LASTEXITCODE -ne 0) { throw "Failed to extract $pkg" }
+            Remove-Item -Force $zipFile
+          }
+
+          "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & "$cudaRoot\bin\nvcc.exe" --version
+
+      - name: Configure & build Windows CUDA targets
+        shell: pwsh
+        env:
+          SCCACHE_DIR: ${{ github.workspace }}\.sccache
+          SCCACHE_CACHE_SIZE: 3G
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cudaRoot = $env:CUDA_PATH
+          & sccache --zero-stats
+          # CMP0141 + Embedded (/Z7) avoids /Zi .pdb files so sccache can cache MSVC .obj files.
+          & cmake -S . -B build-win-cuda-v100 -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW `
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
+            -DGGML_CUDA=ON `
+            -DGGML_CUDA_KVARN=ON `
+            -DGGML_CUDA_FA_ALL_QUANTS=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES="$($env:CUDA_ARCHITECTURES)" `
+            -DCUDAToolkit_ROOT="$cudaRoot" `
+            -DCMAKE_CUDA_COMPILER="$cudaRoot\bin\nvcc.exe" `
+            -DGGML_CCACHE=OFF `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache `
+            -DGGML_NATIVE=OFF `
+            -DGGML_AVX2=ON `
+            -DGGML_FMA=ON `
+            -DGGML_F16C=ON `
+            -DGGML_BACKEND_DL=OFF `
+            -DGGML_RPC=OFF `
+            -DLLAMA_BUILD_BORINGSSL=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_TESTS=ON `
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & cmake --build build-win-cuda-v100 --parallel `
+            --target llama-server llama-cli llama-bench llama-perplexity test-backend-ops
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & sccache --show-stats
+          & sccache --stop-server | Out-Null
+
+      - name: Stage Windows V100 binary bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "artifact-win-cuda-v100"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $binDir = "build-win-cuda-v100\bin"
+          $exes = @(
+            "llama-server.exe",
+            "llama-cli.exe",
+            "llama-bench.exe",
+            "llama-perplexity.exe",
+            "test-backend-ops.exe"
+          )
+          foreach ($exe in $exes) {
+            $src = Join-Path $binDir $exe
+            if (-not (Test-Path $src)) { throw "Expected binary missing: $src" }
+            Copy-Item $src $stage
+          }
+
+          # Bundle built project DLLs (ggml*.dll, llama*.dll, mtmd*.dll).
+          # CUDA 12.9 runtime DLLs (cudart64_12.dll, cublas64_12.dll, cublasLt64_12.dll)
+          # are intentionally NOT bundled to keep artifact size small; install CUDA 12.9 on the host.
+          Get-ChildItem -Path $binDir -Filter "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName $stage
+          }
+
+          @(
+            "qwen-cpp Windows CUDA 12.9 (sm_70;sm_86) CI Artifact"
+            "Commit: $($env:GITHUB_SHA)"
+            "Requires: NVIDIA CUDA 12.9 runtime (cudart64_12.dll, cublas64_12.dll, cublasLt64_12.dll) on PATH"
+          ) | Set-Content -Path (Join-Path $stage "README-artifact.txt") -Encoding utf8
+
+          Get-ChildItem $stage | Format-Table Name, Length -AutoSize
+
+      - name: Upload Windows V100 binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen-cpp-win-cuda12.9-sm70_86
+          path: artifact-win-cuda-v100
+          retention-days: 7
+          if-no-files-found: error
