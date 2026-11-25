@@ -431,44 +431,52 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-lfm2
-        LABEL main
-        ARGS -m "${MODEL_DIR}/lfm2-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-lfm2 PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
+    if (EXISTS "${PROJECT_SOURCE_DIR}/src/models/lfm2.cpp")
+        llama_test(
+            test-recurrent-state-rollback
+            NAME test-recurrent-state-rollback-lfm2
+            LABEL main
+            ARGS -m "${MODEL_DIR}/lfm2-dense.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback-lfm2 PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endif()
 
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-nemotron-h
-        LABEL main
-        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-dsv4
-        LABEL main
-        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-kimi-k3
-        LABEL main
-        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
-        FIXTURES_REQUIRED generate-models
-        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
-    )
+    if (EXISTS "${PROJECT_SOURCE_DIR}/src/models/nemotron-h.cpp")
+        llama_test(
+            test-recurrent-state-rollback
+            NAME test-recurrent-state-rollback-nemotron-h
+            LABEL main
+            ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endif()
+    if (EXISTS "${PROJECT_SOURCE_DIR}/src/models/deepseek4.cpp")
+        llama_test(
+            test-recurrent-state-rollback
+            NAME test-recurrent-state-rollback-dsv4
+            LABEL main
+            ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endif()
+    if (EXISTS "${PROJECT_SOURCE_DIR}/src/models/kimi-k3.cpp")
+        llama_test(
+            test-recurrent-state-rollback
+            NAME test-recurrent-state-rollback-kimi-k3
+            LABEL main
+            ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+            FIXTURES_REQUIRED generate-models
+            ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+        )
+    endif()
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
@@ -520,8 +528,10 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
-llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
-set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+if (EXISTS "${PROJECT_SOURCE_DIR}/src/models/llama.cpp")
+    llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
+    set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+endif()
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-kv-history.cpp)

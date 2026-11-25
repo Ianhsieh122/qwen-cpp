@@ -58,9 +58,11 @@ def main() -> None:
 
     fattn_mma = (ROOT / "ggml/src/ggml-cuda/fattn-mma-f16.cuh").read_text(encoding="utf-8")
     volta_mma = fattn_mma.split("ggml_cuda_fattn_mma_get_config_volta(", 1)[1].split("ggml_cuda_fattn_mma_get_config_rdna(", 1)[0]
-    for ncols in (8, 16, 32, 64, 128):
+    for ncols in (8, 16, 32, 128):
         if not re.search(rf"GGML_CUDA_FATTN_MMA_CONFIG_CASE\(\s*256,\s*256,\s*{ncols},\s*\d+,\s*\d+,\s*\d+,\s*\d+,\s*\d+,\s*\d+,\s*1,\s*true\)", volta_mma):
             raise AssertionError(f"Volta MMA (256, 256, {ncols}) must set nstages_target = 1")
+    if not re.search(r"GGML_CUDA_FATTN_MMA_CONFIG_CASE\(\s*256,\s*256,\s*64,\s*256,\s*1,\s*64,\s*64,\s*64,\s*64,\s*1,\s*false\)", volta_mma):
+        raise AssertionError("Volta MMA (256, 256, 64) must use tuned 256-thread 64-tile config")
 
     fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
     require(fattn, "gqa_ratio_eff=2", "fattn.cu Volta GQA routing comment should match effective 2-col tile")
@@ -167,6 +169,23 @@ def main() -> None:
     ):
         require(fattn_vec, needle, f"fattn-vec.cuh missing Batch A Q8_0/Q4_0 GQA-6 decode support: {needle}")
     require(fattn, "gqa6_vec_kv_supported", "fattn.cu missing Q8_0/Q4_0 GQA-6 vector routing")
+
+    # v0.1.1: P0 + P1 Qwen 3.8 27B PP/TG/long-context optimizations
+    require(qwen35, "t->ne[1] < 16", "qwen35.cpp must gate split_act_type on n_tokens >= 16")
+    require(convert, "dequant_iq4nl_pair_f16_volta", "convert.cu missing Volta IQ4_XS prmt F16 unpacker")
+    require(fattn_vec, "use_q8_dot", "fattn-vec.cuh missing dp4a Q-quantized GQA-6 dot path")
+    require(fattn_vec, "exp2f", "fattn-vec.cuh missing exp2f log2-space softmax")
+    require(mmvq, "vec_dot_q5_K_q8_1_multi_vdr2", "mmvq.cu missing multi-col Q5_K unpack-once kernel")
+    require(mmvq, "vec_dot_iq4_xs_q8_1_multi_vdr4", "mmvq.cu missing multi-col IQ4_XS unpack-once kernel")
+    require(gdn_volta, "smem_exp_g", "gated-delta-net-volta.cu missing precomputed chunk exp(G) table")
+    require(gdn_volta, "smem_decay", "gated-delta-net-volta.cu missing precomputed decay table")
+    require(cuda_cu, "32 * 1024 * 1024", "ggml-cuda.cu missing 32 MiB cuBLAS src1 F16 cache")
+    require(cuda_cu, "ggml_backend_fill_causal_mask_f16_async", "ggml-cuda.cu missing GPU causal mask fill proc")
+    ggml_h = (ROOT / "ggml/include/ggml.h").read_text(encoding="utf-8")
+    kv_cache_cpp = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    require(ggml_h, "GGML_CAUSAL_MASK_MAGIC", "ggml.h missing GGML_CAUSAL_MASK_MAGIC")
+    require(kv_cache_cpp, "GGML_CAUSAL_MASK_MAGIC", "llama-kv-cache.cpp missing deferred causal mask path")
+    require(backend_cpp, "GGML_CAUSAL_MASK_MAGIC", "ggml-backend.cpp missing GPU causal mask dispatch")
 
 
 if __name__ == "__main__":

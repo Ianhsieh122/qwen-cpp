@@ -344,6 +344,11 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout tag metadata
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
       - name: Download Linux release artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -367,9 +372,9 @@ jobs:
           TAG: ${{ needs.resolve-tag.outputs.tag }}
           DRAFT: ${{ needs.resolve-tag.outputs.draft }}
         run: |
-          NOTES=$(cat <<EOF
-          ## qwen-cpp ${TAG} (CUDA 12.9 — Volta \`sm_70\` + Ampere \`sm_86\`)
-
+          TAG_NOTES=$(git tag -l --format='%(contents)' "$TAG" | sed '/^-----BEGIN PGP SIGNATURE-----$/,$d')
+          HEADER="## qwen-cpp ${TAG} (CUDA 12.9 — Volta \`sm_70\` + Ampere \`sm_86\`)"
+          ASSETS_NOTES=$(cat <<EOF
           ### Assets
           - \`qwen-cpp-${TAG}-bin-win-cuda-12.9-sm70_86-x64.zip\` — Windows x64 binaries (\`llama-server\`, \`llama-cli\`, \`llama-bench\`, \`llama-perplexity\`, \`test-backend-ops\`) + project DLLs.
           - \`cudart-qwen-cpp-bin-win-cuda-12.9-x64.zip\` — Optional Windows CUDA 12.9 runtime DLLs (\`cudart64_12.dll\`, \`cublas64_12.dll\`, \`cublasLt64_12.dll\`). Extract alongside the binaries if CUDA 12.9 is not installed on \`PATH\`.
@@ -377,6 +382,11 @@ jobs:
           - \`SHA256SUMS.txt\` — SHA-256 checksums for all archives.
           EOF
           )
+          if [ -n "$TAG_NOTES" ]; then
+            NOTES="${HEADER}"$'\n\n'"${TAG_NOTES}"$'\n\n'"${ASSETS_NOTES}"
+          else
+            NOTES="${HEADER}"$'\n\n'"${ASSETS_NOTES}"
+          fi
 
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --repo "${{ github.repository }}" --clobber

@@ -1011,7 +1011,7 @@ static void test_draft_ubatch_configuration_is_independent() {
     params.n_parallel = 16;
     params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
     draft = common_base_params_to_speculative(params);
-    assert(draft.n_ubatch == 128);
+    assert(draft.n_ubatch == 512); // MTP clamps draft.n_ubatch to [128, min(params.n_ubatch, 512)]
 
     params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
     assert(parse(params, {

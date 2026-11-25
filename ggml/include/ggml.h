@@ -480,6 +480,13 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V = 3,
     };
 
+    // Compact causal F16 mask descriptor stored in op_params of a GGML_OP_NONE F16 input mask tensor:
+    //   op_params[0] = GGML_CAUSAL_MASK_MAGIC when valid, else 0
+    //   op_params[1] = p_start (int32_t: query position of row 0; row i has position p_start + i)
+    //   op_params[2] = n_valid (int32_t: valid KV prefix length; cell j kept iff j < min(p_start + i + 1, n_valid))
+    //   op_params[3] = host_filled (int32_t: 1 if host buffer has been filled, 0 if deferred)
+    #define GGML_CAUSAL_MASK_MAGIC 0x434D534B
+
     // op hint
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,

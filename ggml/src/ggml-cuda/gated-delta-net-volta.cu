@@ -88,6 +88,8 @@ gated_delta_net_volta_chunked_kernel(
     __shared__ float               smem_L[16][17];               // unit lower triangular L
     __shared__ float               smem_A[16][17];               // lower triangular A_qk
     __shared__ float               smem_g_cs[16];
+    __shared__ float               smem_exp_g[16];
+    __shared__ float               smem_decay[16];
     __shared__ float               smem_beta[16];
 
     // Load initial state M_blk[col0..col0+31, 32*warp..32*warp+31] into FP32 Volta MMA tiles
@@ -147,6 +149,12 @@ gated_delta_net_volta_chunked_kernel(
                 acc += smem_g_cs[t];
                 smem_g_cs[t] = acc;
             }
+        }
+        __syncthreads();
+
+        if (tid < BT) {
+            smem_exp_g[tid] = expf(smem_g_cs[tid]);
+            smem_decay[tid] = expf(smem_g_cs[BT - 1] - smem_g_cs[tid]);
         }
         __syncthreads();
 
@@ -239,7 +247,7 @@ gated_delta_net_volta_chunked_kernel(
             const int t   = idx & 15; // 0..15
             const float mk = smem_part[0][c][t] + smem_part[1][c][t] +
                              smem_part[2][c][t] + smem_part[3][c][t];
-            smem_Delta_f32[c][t] = smem_beta[t] * (smem_V[c][t] - expf(smem_g_cs[t]) * mk);
+            smem_Delta_f32[c][t] = smem_beta[t] * (smem_V[c][t] - smem_exp_g[t] * mk);
         }
         __syncthreads();
 
@@ -260,15 +268,16 @@ gated_delta_net_volta_chunked_kernel(
             const int t   = idx & 15; // 0..15
             const float mq = smem_part[0][c][t] + smem_part[1][c][t] +
                              smem_part[2][c][t] + smem_part[3][c][t];
-            smem_V[c][t] = expf(smem_g_cs[t]) * mq;
+            smem_V[c][t] = smem_exp_g[t] * mq;
         }
         __syncthreads();
 
         // ------------------------------------------------------------------
         // Step 4: Forward substitution L @ Delta = R, output O, pack Delta_decay
         // ------------------------------------------------------------------
-        if (warp == 0) {
-            const int c = lane; // 0..31 -> 1 full warp, 100% coalesced output stores
+        // Step 4a: 4-warp parallel forward substitution across SM sub-partitions
+        if (lane < 8) {
+            const int c = warp * 8 + lane; // 0..31 split across 4 warps
             float d[BT];
 #pragma unroll
             for (int t = 0; t < BT; ++t) {
@@ -286,16 +295,25 @@ gated_delta_net_volta_chunked_kernel(
                 d[t] = sum;
             }
 
-            const float g_last = smem_g_cs[BT - 1];
 #pragma unroll
             for (int t = 0; t < BT; ++t) {
-                float o_t = smem_V[c][t];
+                smem_Delta_f32[c][t] = d[t];
+            }
+        }
+        __syncthreads();
+
+        // Step 4b: all 4 warps active, 100% coalesced output stores & Delta_h pack
+        {
+            const int c = lane; // 0..31
 #pragma unroll
+            for (int r = 0; r < BT / 4; ++r) {
+                const int t = r * 4 + warp;
+                float o_t = smem_V[c][t];
                 for (int j = 0; j <= t; ++j) {
-                    o_t += smem_A[t][j] * d[j];
+                    o_t += smem_A[t][j] * smem_Delta_f32[c][j];
                 }
                 attn_data[(t0 + t) * S_v * H + (col0 + c)] = o_t * scale;
-                smem_Delta_h[c][t] = __float2half(d[t] * expf(g_last - smem_g_cs[t]));
+                smem_Delta_h[c][t] = __float2half(smem_Delta_f32[c][t] * smem_decay[t]);
             }
         }
         __syncthreads();
@@ -303,7 +321,7 @@ gated_delta_net_volta_chunked_kernel(
         // ------------------------------------------------------------------
         // Step 5: State update M_blk = exp(G_15) * M_blk + Delta_decay @ K_c
         // ------------------------------------------------------------------
-        const float g_decay = expf(smem_g_cs[BT - 1]);
+        const float g_decay = smem_exp_g[BT - 1];
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
 #pragma unroll

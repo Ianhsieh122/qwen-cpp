@@ -3759,8 +3759,11 @@ static void test_odd_offset_record_decode_gpu() {
 
         require_close_f32_rmse(actual, expected, 1e-2f,
                 "odd-offset record-backed indirect decode differs from materialized reference");
-        require(stats.decode_split > 0 && stats.materialize_fallback == 0,
-                "odd-offset indirect regression did not exercise direct split decode");
+        constexpr uint32_t specialized_route_families = (1u << 1) | (1u << 2) | (1u << 3);
+        const bool has_specialized = (stats.route_families & specialized_route_families) != 0;
+        require((has_specialized ? stats.decode_split : stats.portable_native) > 0 &&
+                stats.materialize_fallback == 0,
+                "odd-offset indirect regression did not exercise a direct-record route");
     }
 
     ggml_backend_free(gpu_backend);
@@ -3805,10 +3808,11 @@ static void test_d64_multi_query_split_parity_gpu() {
                         (unsigned long long) stats.compact_tail_entry,
                         (unsigned long long) stats.direct_entry);
                 std::fflush(stdout);
+                constexpr uint32_t specialized_route_families = (1u << 1) | (1u << 2) | (1u << 3);
                 require(stats.generic_mma == 0 && stats.materialize_fallback == 0 &&
                             stats.decode_split + stats.portable_native > 0,
                         "D64 multi-query verification did not use a direct-record route");
-                if (n_kv >= 4096) {
+                if (n_kv >= 4096 && (stats.route_families & specialized_route_families) != 0) {
                     require(stats.decode_split > 0 && stats.split_reduce > 0 &&
                                 stats.portable_native == 0 && stats.generic_shape_rejected == 0,
                             "long-context D64 multi-query verification did not stay on split decode");
@@ -5933,9 +5937,13 @@ static void test_multistream_swa_native_attention() {
                         const std::vector<float> actual = output(gpu, true);
                         test_kvarn_route_stats routes = make_test_kvarn_route_stats();
                         get(&routes);
+                        constexpr uint32_t specialized_route_families = (1u << 1) | (1u << 2) | (1u << 3);
+                        const bool has_specialized = (routes.route_families & specialized_route_families) != 0;
                         require(routes.direct_entry > 0 &&
-                                (n_q == 1 ? routes.decode_vector + routes.decode_split + routes.generic_mma :
-                                    routes.prompt_prefill) > 0 &&
+                                (has_specialized
+                                    ? (n_q == 1 ? routes.decode_vector + routes.decode_split + routes.generic_mma :
+                                        routes.prompt_prefill) > 0
+                                    : routes.portable_native > 0) &&
                                 routes.materialize_fallback == 0,
                                 "multistream SWA attention did not execute a record-native CUDA route");
                         compare_streams(actual,

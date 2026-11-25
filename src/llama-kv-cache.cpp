@@ -3932,6 +3932,7 @@ void llama_kv_cache::set_input_kq_mask_mapped(
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    dst->op_params[0] = 0;
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -3946,6 +3947,56 @@ void llama_kv_cache::set_input_kq_mask_mapped(
     // only the SWA cache (or the SWA layers of a single cache) become non-causal
     if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
+    static const bool gpu_causal_mask_enabled = []() {
+        const char * env = std::getenv("GGML_CUDA_GPU_CAUSAL_MASK");
+        return env == nullptr || std::strcmp(env, "0") != 0;
+    }();
+    if (gpu_causal_mask_enabled &&
+            !tail && !uses_shared_tail() &&
+            dst->type == GGML_TYPE_F16 && ggml_is_contiguous(dst) &&
+            causal_attn && swa_type == LLAMA_SWA_TYPE_NONE &&
+            !hparams.use_alibi && !ubatch->is_pos_2d() &&
+            n_stream == 1 && read_cells.empty() &&
+            n_tps > 0 && n_kv > 0 && n_kv <= INT32_MAX) {
+        const llama_seq_id seq_id  = ubatch->seq_id[0][0];
+        const llama_pos    p_start = ubatch->pos[0];
+        bool ok = (p_start >= 0);
+        if (ok) {
+            for (int64_t i = 0; i < n_tps; ++i) {
+                if (ubatch->n_seq_id[i] <= 0 || ubatch->seq_id[i][0] != seq_id || ubatch->pos[i] != p_start + i) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (ok) {
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const uint32_t max_scan = std::min<uint32_t>(uint32_t(n_kv), cells.used_max_p1());
+            uint32_t n_valid = 0;
+            while (n_valid < max_scan &&
+                   !cells.is_empty(n_valid) &&
+                   cells.seq_has(n_valid, seq_id) &&
+                   cells.pos_get(n_valid) == llama_pos(n_valid)) {
+                ++n_valid;
+            }
+            if (cells.get_used() != n_valid || cells.used_max_p1() != n_valid) {
+                for (uint32_t j = n_valid; j < max_scan; ++j) {
+                    if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok) {
+                dst->op_params[0] = GGML_CAUSAL_MASK_MAGIC;
+                dst->op_params[1] = int32_t(p_start);
+                dst->op_params[2] = int32_t(n_valid);
+                dst->op_params[3] = 0;
+                return;
+            }
+        }
     }
 
     //const int64_t t_start = ggml_time_us();

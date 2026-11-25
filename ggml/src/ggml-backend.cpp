@@ -1921,6 +1921,32 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static void ggml_materialize_causal_mask_f16_host(struct ggml_tensor * t) {
+    GGML_ASSERT(t->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(t));
+    GGML_ASSERT(t->buffer && ggml_backend_buffer_is_host(t->buffer));
+
+    const int32_t p_start = t->op_params[1];
+    const int32_t n_valid = t->op_params[2];
+    const int64_t n_kv    = t->ne[0];
+    const int64_t n_rows  = t->ne[1] * t->ne[2] * t->ne[3];
+    const int64_t row_el  = t->nb[1] / sizeof(uint16_t);
+    uint16_t *    data    = (uint16_t *) t->data;
+
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const int64_t row_in_u = r % t->ne[1];
+        const int64_t raw_lim  = (int64_t) p_start + row_in_u + 1;
+        const int64_t limit    = std::max<int64_t>(0, std::min<int64_t>(raw_lim, std::min<int64_t>(n_valid, n_kv)));
+        uint16_t *    row_ptr  = data + r * row_el;
+        std::memset(row_ptr, 0, (size_t) limit * sizeof(uint16_t));
+        std::fill(row_ptr + limit, row_ptr + n_kv, (uint16_t) 0xFC00u);
+    }
+    t->op_params[3] = 1;
+}
+
+typedef bool (*ggml_backend_fill_causal_mask_f16_async_t)(
+        ggml_backend_t backend, struct ggml_tensor * dst, int32_t p_start, int32_t n_valid);
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1953,6 +1979,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                if (input->op == GGML_OP_NONE && input->op_params[0] == GGML_CAUSAL_MASK_MAGIC && !sched->callback_eval) {
+                    auto fill_fn = (ggml_backend_fill_causal_mask_f16_async_t) ggml_backend_reg_get_proc_address(
+                            ggml_backend_dev_backend_reg(split_backend->device),
+                            "ggml_backend_fill_causal_mask_f16_async");
+                    if (fill_fn != nullptr) {
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                            ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                        } else {
+                            ggml_backend_synchronize(split_backend);
+                        }
+                        if (fill_fn(split_backend, input_cpy, input->op_params[1], input->op_params[2])) {
+                            continue;
+                        }
+                    }
+                    if (input->op_params[3] == 0) {
+                        ggml_materialize_causal_mask_f16_host(input);
+                    }
+                } else if (input->op == GGML_OP_NONE && input->op_params[0] == GGML_CAUSAL_MASK_MAGIC && input->op_params[3] == 0) {
+                    ggml_materialize_causal_mask_f16_host(input);
+                }
+
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2074,6 +2121,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                    }
+                }
+            }
+        }
+
+        // Ensure deferred host causal masks are materialized for CPU splits, integrated GPUs accessing host buffers, or callback_eval.
+        if (ggml_backend_dev_type(split_backend->device) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                ggml_backend_dev_type(split_backend->device) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
+                sched->callback_eval != nullptr) {
+            for (int k = 0; k < split->graph.n_nodes; ++k) {
+                struct ggml_tensor * n = split->graph.nodes[k];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    struct ggml_tensor * src = n->src[s];
+                    if (src != NULL && (src->flags & GGML_TENSOR_FLAG_INPUT) &&
+                            src->op == GGML_OP_NONE && src->op_params[0] == GGML_CAUSAL_MASK_MAGIC &&
+                            src->op_params[3] == 0 && src->buffer && ggml_backend_buffer_is_host(src->buffer)) {
+                        ggml_materialize_causal_mask_f16_host(src);
                     }
                 }
             }

@@ -42,6 +42,19 @@
 #include <string>
 #include <vector>
 
+struct llama_model_vocab_only final : public llama_model_base {
+    using llama_model_base::llama_model_base;
+    void load_arch_hparams(llama_model_loader &) override {
+        throw std::runtime_error("vocab-only model cannot load arch hparams");
+    }
+    void load_arch_tensors(llama_model_loader &) override {
+        throw std::runtime_error("vocab-only model cannot load arch tensors");
+    }
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override {
+        throw std::runtime_error("vocab-only model cannot build graphs");
+    }
+};
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
@@ -69,6 +82,11 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params) {
     llm_arch arch = ml.get_arch();
     if (arch == LLM_ARCH_UNKNOWN) {
+        if (params.vocab_only) {
+            auto * model = new llama_model_vocab_only(params);
+            model->arch = LLM_ARCH_UNKNOWN;
+            return model;
+        }
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 

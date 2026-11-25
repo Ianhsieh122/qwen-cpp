@@ -1095,6 +1095,10 @@ bool ggml_cuda_flash_attn_ext_kvarn_portable_supported(
 bool ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(
         int device,
         const ggml_tensor * dst) {
+    const char * force_materialize = getenv("GGML_KVARN_TEST_FORCE_MATERIALIZE_FATTN");
+    if (force_materialize != nullptr && atoi(force_materialize) != 0) {
+        return false;
+    }
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
     const char * force_portable = getenv("GGML_KVARN_TEST_FORCE_PORTABLE_FATTN");
     ggml_cuda_fattn_kvarn_plan plan;

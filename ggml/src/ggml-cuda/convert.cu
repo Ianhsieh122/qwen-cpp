@@ -72,9 +72,17 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
 
         const half * b0 = ((const half  *) vals) + (sizeof(block_q8_0)/sizeof(half)) * ((iy + 2*threadIdx.x)/QK8_0);
         const half    d = *b0;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        const uint16_t q16 = ((const uint16_t *) (b0 + 1))[threadIdx.x % (QK8_0/2)];
+        const uint32_t q_u = (uint32_t) q16 ^ 0x00008080u;
+        const uint32_t p   = __byte_perm(q_u, 0x64006400u, 0x7170);
+        const half2    h   = __hadd2(reinterpret_cast<const half2 &>(p), __float2half2_rn(-1152.0f));
+        y2[iy/2 + threadIdx.x] = __hmul2(h, __half2half2(d));
+#else
         const char2  qs = ((const char2 *) (b0 + 1))[threadIdx.x % (QK8_0/2)];
 
         y2[iy/2 + threadIdx.x] = __hmul2(make_half2(qs.x, qs.y), __half2half2(d));
+#endif
     }
 #else
     GGML_UNUSED_VARS(vx, y, k);
@@ -470,6 +478,22 @@ static __global__ void dequantize_block_iq2_s_f16(const void * __restrict__ vx, 
     *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
 }
 
+static __device__ __forceinline__ uint32_t load_uint32_b2(const void * p) {
+    const uint16_t * p16 = reinterpret_cast<const uint16_t *>(p);
+    return static_cast<uint32_t>(p16[0]) | (static_cast<uint32_t>(p16[1]) << 16);
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+static __device__ __forceinline__ uint32_t dequant_iq4nl_pair_f16_volta(
+        uint8_t i0, uint8_t i1, const half2 d_h2, const half2 neg_1152) {
+    const uint32_t u = ((uint32_t) (uint8_t) (kvalues_iq4nl[i0] ^ (int8_t) 0x80)) |
+                       (((uint32_t) (uint8_t) (kvalues_iq4nl[i1] ^ (int8_t) 0x80)) << 8);
+    const uint32_t p = __byte_perm(u, 0x64006400u, 0x7170);
+    const half2    h = __hmul2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p), neg_1152));
+    return reinterpret_cast<const uint32_t &>(h);
+}
+#endif
+
 // 16 values per thread, 16 threads per 256-value block: two 16 B stores.
 template <int BPB>
 static __global__ void dequantize_block_iq4_xs_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
@@ -487,6 +511,20 @@ static __global__ void dequantize_block_iq4_xs_f16(const void * __restrict__ vx,
         (((x->scales_h >> 2*ib) & 3) << 4)) - 32);
 
     uint4 lo, hi;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    const uint32_t w0 = load_uint32_b2(q4 + 0);
+    const uint32_t w1 = load_uint32_b2(q4 + 4);
+    const half2 d_h2     = __float2half2_rn(d);
+    const half2 neg_1152 = __float2half2_rn(-1152.0f);
+    lo.x = dequant_iq4nl_pair_f16_volta((w0 >>  0) & 0xf, (w0 >>  8) & 0xf, d_h2, neg_1152);
+    lo.y = dequant_iq4nl_pair_f16_volta((w0 >> 16) & 0xf, (w0 >> 24) & 0xf, d_h2, neg_1152);
+    lo.z = dequant_iq4nl_pair_f16_volta((w1 >>  0) & 0xf, (w1 >>  8) & 0xf, d_h2, neg_1152);
+    lo.w = dequant_iq4nl_pair_f16_volta((w1 >> 16) & 0xf, (w1 >> 24) & 0xf, d_h2, neg_1152);
+    hi.x = dequant_iq4nl_pair_f16_volta((w0 >>  4) & 0xf, (w0 >> 12) & 0xf, d_h2, neg_1152);
+    hi.y = dequant_iq4nl_pair_f16_volta((w0 >> 20) & 0xf, (w0 >> 28) & 0xf, d_h2, neg_1152);
+    hi.z = dequant_iq4nl_pair_f16_volta((w1 >>  4) & 0xf, (w1 >> 12) & 0xf, d_h2, neg_1152);
+    hi.w = dequant_iq4nl_pair_f16_volta((w1 >> 20) & 0xf, (w1 >> 28) & 0xf, d_h2, neg_1152);
+#else
     lo.x = dequant_pack_half2(d*kvalues_iq4nl[q4[0] & 0xf], d*kvalues_iq4nl[q4[1] & 0xf]);
     lo.y = dequant_pack_half2(d*kvalues_iq4nl[q4[2] & 0xf], d*kvalues_iq4nl[q4[3] & 0xf]);
     lo.z = dequant_pack_half2(d*kvalues_iq4nl[q4[4] & 0xf], d*kvalues_iq4nl[q4[5] & 0xf]);
@@ -495,6 +533,7 @@ static __global__ void dequantize_block_iq4_xs_f16(const void * __restrict__ vx,
     hi.y = dequant_pack_half2(d*kvalues_iq4nl[q4[2] >>  4], d*kvalues_iq4nl[q4[3] >>  4]);
     hi.z = dequant_pack_half2(d*kvalues_iq4nl[q4[4] >>  4], d*kvalues_iq4nl[q4[5] >>  4]);
     hi.w = dequant_pack_half2(d*kvalues_iq4nl[q4[6] >>  4], d*kvalues_iq4nl[q4[7] >>  4]);
+#endif
 
     half * dst = yy + iblk*QK_K + 32*ib + 8*half_;
     *reinterpret_cast<uint4 *>(dst)      = lo;
@@ -507,11 +546,6 @@ static __global__ void dequantize_block_iq4_xs_f16(const void * __restrict__ vx,
         return;                                                   \
     }                                                             \
     const int t  = threadIdx.x % 32;
-
-static __device__ __forceinline__ uint32_t load_uint32_b2(const void * p) {
-    const uint16_t * p16 = reinterpret_cast<const uint16_t *>(p);
-    return static_cast<uint32_t>(p16[0]) | (static_cast<uint32_t>(p16[1]) << 16);
-}
 
 template <int BPB>
 static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
@@ -607,6 +641,31 @@ static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, h
     const uint32_t qh0 = *reinterpret_cast<const uint32_t *>(qh_ptr + 0);
     const uint32_t qh1 = *reinterpret_cast<const uint32_t *>(qh_ptr + 4);
 
+    uint4 o;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    const uint32_t v0    = ((q0 >> shift) & 0x0F0F0F0Fu) | (((qh0 >> is) & 0x01010101u) << 4);
+    const uint32_t v1    = ((q1 >> shift) & 0x0F0F0F0Fu) | (((qh1 >> is) & 0x01010101u) << 4);
+    const uint32_t magic = 0x64006400u;
+
+    const uint32_t p0 = __byte_perm(v0, magic, 0x7170);
+    const uint32_t p1 = __byte_perm(v0, magic, 0x7372);
+    const uint32_t p2 = __byte_perm(v1, magic, 0x7170);
+    const uint32_t p3 = __byte_perm(v1, magic, 0x7372);
+
+    const half2 neg_1024 = __float2half2_rn(-1024.0f);
+    const half2 d_h2     = __float2half2_rn(d);
+    const half2 neg_m_h2 = __float2half2_rn(-min_val);
+
+    const half2 h0 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p0), neg_1024), neg_m_h2);
+    const half2 h1 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p1), neg_1024), neg_m_h2);
+    const half2 h2 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p2), neg_1024), neg_m_h2);
+    const half2 h3 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p3), neg_1024), neg_m_h2);
+
+    o.x = reinterpret_cast<const uint32_t &>(h0);
+    o.y = reinterpret_cast<const uint32_t &>(h1);
+    o.z = reinterpret_cast<const uint32_t &>(h2);
+    o.w = reinterpret_cast<const uint32_t &>(h3);
+#else
     float val[8];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -621,11 +680,11 @@ static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, h
         val[k + 4] = d * (float) q_val1 - min_val;
     }
 
-    uint4 o;
     o.x = dequant_pack_half2(val[0], val[1]);
     o.y = dequant_pack_half2(val[2], val[3]);
     o.z = dequant_pack_half2(val[4], val[5]);
     o.w = dequant_pack_half2(val[6], val[7]);
+#endif
 
     *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
 }
@@ -660,6 +719,30 @@ static __global__ void dequantize_block_q6_K_f16(const void * __restrict__ vx, h
     const uint32_t qh_w0 = load_uint32_b2(qh_ptr + 0);
     const uint32_t qh_w1 = load_uint32_b2(qh_ptr + 4);
 
+    uint4 o;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    const uint32_t v0    = ((ql_w0 >> ql_shift) & 0x0F0F0F0Fu) | (((qh_w0 >> qh_shift) & 0x03030303u) << 4);
+    const uint32_t v1    = ((ql_w1 >> ql_shift) & 0x0F0F0F0Fu) | (((qh_w1 >> qh_shift) & 0x03030303u) << 4);
+    const uint32_t magic = 0x64006400u;
+
+    const uint32_t p0 = __byte_perm(v0, magic, 0x7170);
+    const uint32_t p1 = __byte_perm(v0, magic, 0x7372);
+    const uint32_t p2 = __byte_perm(v1, magic, 0x7170);
+    const uint32_t p3 = __byte_perm(v1, magic, 0x7372);
+
+    const half2 neg_1056 = __float2half2_rn(-1056.0f);
+    const half2 d_h2     = __float2half2_rn(d_sc);
+
+    const half2 h0 = __hmul2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p0), neg_1056));
+    const half2 h1 = __hmul2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p1), neg_1056));
+    const half2 h2 = __hmul2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p2), neg_1056));
+    const half2 h3 = __hmul2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p3), neg_1056));
+
+    o.x = reinterpret_cast<const uint32_t &>(h0);
+    o.y = reinterpret_cast<const uint32_t &>(h1);
+    o.z = reinterpret_cast<const uint32_t &>(h2);
+    o.w = reinterpret_cast<const uint32_t &>(h3);
+#else
     float val[8];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -674,11 +757,11 @@ static __global__ void dequantize_block_q6_K_f16(const void * __restrict__ vx, h
         val[k + 4] = d_sc * (float) q_val1;
     }
 
-    uint4 o;
     o.x = dequant_pack_half2(val[0], val[1]);
     o.y = dequant_pack_half2(val[2], val[3]);
     o.z = dequant_pack_half2(val[4], val[5]);
     o.w = dequant_pack_half2(val[6], val[7]);
+#endif
 
     *reinterpret_cast<uint4 *>(yy + iblk*QK_K + 8*t) = o;
 }
@@ -707,6 +790,31 @@ static __global__ void dequantize_block_q2_K_f16(const void * __restrict__ vx, h
     const uint32_t q0 = *reinterpret_cast<const uint32_t *>(q_ptr + 0);
     const uint32_t q1 = *reinterpret_cast<const uint32_t *>(q_ptr + 4);
 
+    uint4 o;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    const uint32_t v0    = (q0 >> shift) & 0x03030303u;
+    const uint32_t v1    = (q1 >> shift) & 0x03030303u;
+    const uint32_t magic = 0x64006400u;
+
+    const uint32_t p0 = __byte_perm(v0, magic, 0x7170);
+    const uint32_t p1 = __byte_perm(v0, magic, 0x7372);
+    const uint32_t p2 = __byte_perm(v1, magic, 0x7170);
+    const uint32_t p3 = __byte_perm(v1, magic, 0x7372);
+
+    const half2 neg_1024 = __float2half2_rn(-1024.0f);
+    const half2 d_h2     = __float2half2_rn(d);
+    const half2 neg_m_h2 = __float2half2_rn(-min_val);
+
+    const half2 h0 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p0), neg_1024), neg_m_h2);
+    const half2 h1 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p1), neg_1024), neg_m_h2);
+    const half2 h2 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p2), neg_1024), neg_m_h2);
+    const half2 h3 = __hfma2(d_h2, __hadd2(reinterpret_cast<const half2 &>(p3), neg_1024), neg_m_h2);
+
+    o.x = reinterpret_cast<const uint32_t &>(h0);
+    o.y = reinterpret_cast<const uint32_t &>(h1);
+    o.z = reinterpret_cast<const uint32_t &>(h2);
+    o.w = reinterpret_cast<const uint32_t &>(h3);
+#else
     float val[8];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -717,11 +825,11 @@ static __global__ void dequantize_block_q2_K_f16(const void * __restrict__ vx, h
         val[k + 4] = d * (float) ((qv1 >> shift) & 3) - min_val;
     }
 
-    uint4 o;
     o.x = dequant_pack_half2(val[0], val[1]);
     o.y = dequant_pack_half2(val[2], val[3]);
     o.z = dequant_pack_half2(val[4], val[5]);
     o.w = dequant_pack_half2(val[6], val[7]);
+#endif
 
     *reinterpret_cast<uint4 *>(yy + iblk * QK_K + 8 * t) = o;
 }
@@ -741,7 +849,8 @@ static __global__ void dequantize_block_q3_K_f16(const void * __restrict__ vx, h
 
     const int is    = 8 * n + 2 * j + (l / 16);
     const int shift = 2 * j;
-    const uint8_t m = 1 << (4 * n + j);
+    const int m_shift = 4 * n + j;
+    const uint8_t m = 1 << m_shift;
 
     const int8_t us =
         is <  4 ? (x->scales[is - 0] & 0xF) | (((x->scales[is + 8] >> 0) & 3) << 4) :
@@ -757,6 +866,30 @@ static __global__ void dequantize_block_q3_K_f16(const void * __restrict__ vx, h
     const uint32_t hm0 = load_uint32_b2(hm_ptr + 0);
     const uint32_t hm1 = load_uint32_b2(hm_ptr + 4);
 
+    uint4 o;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    const uint32_t v0    = ((q0 >> shift) & 0x03030303u) | (((hm0 >> m_shift) & 0x01010101u) << 2);
+    const uint32_t v1    = ((q1 >> shift) & 0x03030303u) | (((hm1 >> m_shift) & 0x01010101u) << 2);
+    const uint32_t magic = 0x64006400u;
+
+    const uint32_t p0 = __byte_perm(v0, magic, 0x7170);
+    const uint32_t p1 = __byte_perm(v0, magic, 0x7372);
+    const uint32_t p2 = __byte_perm(v1, magic, 0x7170);
+    const uint32_t p3 = __byte_perm(v1, magic, 0x7372);
+
+    const half2 neg_1028 = __float2half2_rn(-1028.0f);
+    const half2 dl_h2    = __float2half2_rn(dl);
+
+    const half2 h0 = __hmul2(dl_h2, __hadd2(reinterpret_cast<const half2 &>(p0), neg_1028));
+    const half2 h1 = __hmul2(dl_h2, __hadd2(reinterpret_cast<const half2 &>(p1), neg_1028));
+    const half2 h2 = __hmul2(dl_h2, __hadd2(reinterpret_cast<const half2 &>(p2), neg_1028));
+    const half2 h3 = __hmul2(dl_h2, __hadd2(reinterpret_cast<const half2 &>(p3), neg_1028));
+
+    o.x = reinterpret_cast<const uint32_t &>(h0);
+    o.y = reinterpret_cast<const uint32_t &>(h1);
+    o.z = reinterpret_cast<const uint32_t &>(h2);
+    o.w = reinterpret_cast<const uint32_t &>(h3);
+#else
     float val[8];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -769,11 +902,11 @@ static __global__ void dequantize_block_q3_K_f16(const void * __restrict__ vx, h
         val[k + 4] = dl * (float) ((int8_t) ((qv1 >> shift) & 3) - ((hv1 & m) ? 0 : 4));
     }
 
-    uint4 o;
     o.x = dequant_pack_half2(val[0], val[1]);
     o.y = dequant_pack_half2(val[2], val[3]);
     o.z = dequant_pack_half2(val[4], val[5]);
     o.w = dequant_pack_half2(val[6], val[7]);
+#endif
 
     *reinterpret_cast<uint4 *>(yy + iblk * QK_K + 8 * t) = o;
 }

@@ -788,6 +788,100 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_multi_vdr1(
     }
 }
 
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q5_K_q8_1_multi_vdr2(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs, const uint32_t stride_col_y, float * __restrict__ dots) {
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
+
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int i8         = (iqs/2) % 4;
+
+    const int * ql = (const int *) (bq5_K->qs + 16 * bq8_offset + 4 * i8);
+    const int * qh = (const int *) (bq5_K->qh + 4 * i8);
+    const int vl0 = ql[0];
+    const int vl1 = ql[4];
+    const int vh0 = qh[0] >> bq8_offset;
+    const int vh1 = qh[4] >> bq8_offset;
+
+    const int v0_lo = ((vl0 >> 0) & 0x0F0F0F0F) | (((vh0 >> 0) << 4) & 0x10101010);
+    const int v1_lo = ((vl1 >> 0) & 0x0F0F0F0F) | (((vh1 >> 0) << 4) & 0x10101010);
+    const int v0_hi = ((vl0 >> 4) & 0x0F0F0F0F) | (((vh0 >> 1) << 4) & 0x10101010);
+    const int v1_hi = ((vl1 >> 4) & 0x0F0F0F0F) | (((vh1 >> 1) << 4) & 0x10101010);
+
+    const uint16_t * scales = (const uint16_t *) bq5_K->scales;
+    const int j  = bq8_offset / 2;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    const uint16_t aux0 = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    const uint16_t aux1 = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+
+    const float2 dm5f = __half22float2(bq5_K->dm);
+    const float d_sc0 =  dm5f.x * (float) (aux0 & 0xFF);
+    const float d_sc1 =  dm5f.x * (float) (aux0 >> 8);
+    const float d_m0  = -dm5f.y * (float) (aux1 & 0xFF);
+    const float d_m1  = -dm5f.y * (float) (aux1 >> 8);
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const block_q8_1 * bq8_c0 = bq8_1 + c * stride_col_y + bq8_offset;
+        const block_q8_1 * bq8_c1 = bq8_c0 + 1;
+        const float d0 = __low2float(bq8_c0->ds);
+        const float d1 = __low2float(bq8_c1->ds);
+
+        const int * q8_0 = (const int *) bq8_c0->qs + i8;
+        const int u00 = q8_0[0];
+        const int u01 = q8_0[4];
+        const int * q8_1 = (const int *) bq8_c1->qs + i8;
+        const int u10 = q8_1[0];
+        const int u11 = q8_1[4];
+
+        const int dot1_0 = ggml_cuda_dp4a(v1_lo, u01, ggml_cuda_dp4a(v0_lo, u00, 0));
+        const int dot2_0 = ggml_cuda_dp4a(0x01010101, u01, ggml_cuda_dp4a(0x01010101, u00, 0));
+        const int dot1_1 = ggml_cuda_dp4a(v1_hi, u11, ggml_cuda_dp4a(v0_hi, u10, 0));
+        const int dot2_1 = ggml_cuda_dp4a(0x01010101, u11, ggml_cuda_dp4a(0x01010101, u10, 0));
+
+        dots[c] = d0 * (d_sc0 * (float) dot1_0 + d_m0 * (float) dot2_0)
+                + d1 * (d_sc1 * (float) dot1_1 + d_m1 * (float) dot2_1);
+    }
+}
+
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi_vdr4(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs, const uint32_t stride_col_y, float * __restrict__ dots) {
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+
+    int2 v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        v[j] = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+    }
+
+    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    const float d_w = __half2float(bq4->d) * (float) (ls - 32);
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const block_q8_1 * bq8_c = bq8_1 + c * stride_col_y + iqs / 4;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int u0 = get_int_b4(bq8_c->qs, j + 0);
+            const int u1 = get_int_b4(bq8_c->qs, j + 4);
+            sumi = ggml_cuda_dp4a(v[j].x, u0, sumi);
+            sumi = ggml_cuda_dp4a(v[j].y, u1, sumi);
+        }
+        dots[c] = (d_w * __low2float(bq8_c->ds)) * (float) sumi;
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -987,6 +1081,38 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         vec_dot_q6_K_q8_1_multi_vdr1<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
+                    }
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q5_K && vdr == 2 && ncols_dst > 1 && ncols_dst <= 4) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int kbx_i = kbx_row_offsets[i] + kbx;
+                float dots[ncols_dst];
+                vec_dot_q5_K_q8_1_multi_vdr2<ncols_dst>(vx, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_q5_K_q8_1_multi_vdr2<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
+                    }
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_IQ4_XS && vdr == 4 && ncols_dst > 1 && ncols_dst <= 4) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int kbx_i = kbx_row_offsets[i] + kbx;
+                float dots[ncols_dst];
+                vec_dot_iq4_xs_q8_1_multi_vdr4<ncols_dst>(vx, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_iq4_xs_q8_1_multi_vdr4<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
 #pragma unroll
                         for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
                     }
@@ -1286,7 +1412,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    if constexpr (c_ncols_dst >= 1 && c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -1297,7 +1423,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=4");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
@@ -1772,7 +1898,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || (dst->ne[1] >= 1 && dst->ne[1] <= 4));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);

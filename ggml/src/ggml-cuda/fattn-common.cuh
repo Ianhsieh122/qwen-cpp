@@ -1538,8 +1538,9 @@ static __global__ void flash_attn_combine_results(
 
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
+    constexpr float LOG2E = 1.4426950408889634f;
     for (int l = 0; l < parallel_blocks; ++l) {
-        const float KQ_max_scale = expf(meta[l].x - kqmax);
+        const float KQ_max_scale = exp2f((meta[l].x - kqmax) * LOG2E);
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
@@ -1689,7 +1690,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 256 || Q->ne[3] > 1);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
