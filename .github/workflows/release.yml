@@ -85,6 +85,7 @@ jobs:
             zip \
             cuda-nvcc-12-9 \
             cuda-cudart-dev-12-9 \
+            cuda-driver-dev-12-9 \
             libcublas-dev-12-9 \
             cuda-cccl-12-9
           echo "/usr/local/cuda-12.9/bin" >> "$GITHUB_PATH"
@@ -165,7 +166,7 @@ jobs:
     # Do NOT use windows-latest (VS 2026 / MSVC 14.5x breaks CUDA 12.9 nvcc,
     # and CUDA 13.x drops sm_70 Volta support).
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: 360
     env:
       SCCACHE_DIR: ${{ github.workspace }}\.sccache
       SCCACHE_CACHE_SIZE: 3G
