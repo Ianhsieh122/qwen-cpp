@@ -926,6 +926,12 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * insert(const server_prompt & prompt, server_prompt_data && data);
 
+    bool can_admit(
+            const server_prompt & prompt,
+            size_t data_size,
+            size_t * out_standalone_size = nullptr,
+            bool * out_already_cached = nullptr) const;
+
     bool erase(const server_prompt_cache_state * entry);
 
     bool load(

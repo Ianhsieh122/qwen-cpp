@@ -397,6 +397,22 @@ struct server_slot {
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
+        // Pre-check admission before allocating RAM or copying gigabytes of KV state
+        // out of VRAM only for server_prompt_cache::admit() to reject and discard it.
+        size_t standalone_size = 0;
+        bool already_cached = false;
+        if (!prompt_cache.can_admit(prompt, cur_size + speculative_state.size(), &standalone_size, &already_cached)) {
+            ++prompt_cache.admission_attempts;
+            ++prompt_cache.admission_failures;
+            if (already_cached) {
+                SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            } else if (prompt_cache.limit_size > 0 && standalone_size > prompt_cache.limit_size) {
+                SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                        standalone_size / (1024.0 * 1024.0), prompt_cache.limit_size / (1024.0 * 1024.0));
+            }
+            return nullptr;
+        }
+
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
@@ -425,7 +441,8 @@ struct server_slot {
             const server_tokens & tokens,
             size_t live_native_restorable_tokens,
             int32_t reuse_alignment,
-            const server_prompt_cache_state * excluded = nullptr) {
+            const server_prompt_cache_state * excluded = nullptr,
+            bool warn_on_fail = true) {
         const uint64_t restored_before = prompt_cache.restore_successes;
         server_prompt_restore_timings restore_timings;
         bool res = prompt_cache.load(
@@ -434,7 +451,9 @@ struct server_slot {
         stats.cache_ram_restore_prepare_ms += restore_timings.prepare_us / 1000.0;
         stats.cache_ram_restore_commit_ms += restore_timings.commit_us / 1000.0;
         if (!res) {
-            SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            if (warn_on_fail) {
+                SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            }
             prompt_cache_reason = "ram_restore_failed";
         } else if (prompt_cache.restore_successes != restored_before) {
             prompt_cache_source = "ram";
@@ -1999,10 +2018,31 @@ private:
                 ret->stats.cache_ram_save_ms = (ggml_time_us() - t_phase) / 1000.0;
 
                 t_phase = ggml_time_us();
-                if (!ret->prompt_load(
-                            *prompt_cache, task.tokens,
-                            prompt_live_native_restorable(*ret, task.tokens),
-                            prompt_reuse_alignment(), admitted)) {
+                bool loaded = ret->prompt_load(
+                        *prompt_cache, task.tokens,
+                        prompt_live_native_restorable(*ret, task.tokens),
+                        prompt_reuse_alignment(), admitted, /*warn_on_fail=*/ !params_base.kv_unified);
+                if (!loaded && params_base.kv_unified) {
+                    // Under unified KV, restore preparation may fail simply because ret's
+                    // old KV cells or another idle slot occupy too much of the shared cache.
+                    // Clear ret (already saved above if admissible) and purge other idle
+                    // slots one by one so the RAM cache restore can succeed.
+                    if (ret->prompt.n_tokens() > 0) {
+                        ret->prompt_clear();
+                        loaded = ret->prompt_load(
+                                *prompt_cache, task.tokens, 0,
+                                prompt_reuse_alignment(), admitted, /*warn_on_fail=*/ false);
+                    }
+                    while (!loaded && try_clear_idle_slots(ret->id)) {
+                        loaded = ret->prompt_load(
+                                *prompt_cache, task.tokens, 0,
+                                prompt_reuse_alignment(), admitted, /*warn_on_fail=*/ false);
+                    }
+                    if (!loaded) {
+                        SLT_WRN(*ret, "%s", "failed to load prompt from cache\n");
+                    }
+                }
+                if (!loaded) {
                     ret->prompt_clear();
                 }
                 ret->stats.cache_ram_load_ms = (ggml_time_us() - t_phase) / 1000.0;
@@ -2025,7 +2065,7 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    bool try_clear_idle_slots(int32_t exclude_slot_id = -1) {
         bool res = false;
 
         if (!params_base.kv_unified) {
@@ -2033,7 +2073,7 @@ private:
         }
 
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.id == exclude_slot_id || slot.is_processing()) {
                 continue;
             }
 

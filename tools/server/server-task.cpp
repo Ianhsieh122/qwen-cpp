@@ -1909,6 +1909,40 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
     return &*admitted;
 }
 
+bool server_prompt_cache::can_admit(
+        const server_prompt & prompt,
+        size_t data_size,
+        size_t * out_standalone_size,
+        bool * out_already_cached) const {
+    if (out_already_cached) {
+        *out_already_cached = false;
+    }
+
+    for (const auto & state : states) {
+        const int cur_lcp_len = state.prompt.tokens.get_common_prefix(prompt.tokens);
+        if (cur_lcp_len == (int) prompt.tokens.size()) {
+            if (out_already_cached) {
+                *out_already_cached = true;
+            }
+            return false;
+        }
+    }
+
+    size_t standalone_size = data_size;
+    for (const auto & ckpt : prompt.checkpoints) {
+        standalone_size += ckpt.size();
+    }
+    if (out_standalone_size) {
+        *out_standalone_size = standalone_size;
+    }
+
+    if (limit_size > 0 && standalone_size > limit_size) {
+        return false;
+    }
+
+    return true;
+}
+
 server_prompt_cache_state * server_prompt_cache::insert(
         const server_prompt & prompt,
         server_prompt_data && data) {
@@ -1922,6 +1956,19 @@ server_prompt_cache_state * server_prompt_cache::alloc(
         const server_prompt & prompt,
         size_t state_size_tgt,
         size_t state_size_dft) {
+    size_t standalone_size = 0;
+    bool already_cached = false;
+    if (!can_admit(prompt, state_size_tgt + state_size_dft, &standalone_size, &already_cached)) {
+        ++admission_attempts;
+        ++admission_failures;
+        if (already_cached) {
+            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+        } else if (limit_size > 0 && standalone_size > limit_size) {
+            SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                    standalone_size / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        }
+        return nullptr;
+    }
     server_prompt_data data;
     try {
         data.main.resize(state_size_tgt);

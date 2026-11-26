@@ -198,6 +198,13 @@ def main() -> None:
     dflash_cpp = (ROOT / "src/models/dflash.cpp").read_text(encoding="utf-8")
     require(dflash_cpp, "embeddings_dflash_inp_f16", "dflash.cpp missing embeddings_dflash_inp_f16")
 
+    # Runtime pipeline-parallel full-n_kv re-prime & server unified-KV prompt-cache guards
+    require(backend_cpp, "ggml_backend_sched_get_n_reallocs", "ggml-backend.cpp missing ggml_backend_sched_get_n_reallocs")
+    require(ctx_cpp, "ggml_backend_sched_get_n_reallocs", "llama-context.cpp missing full-n_kv pipeline re-prime")
+    srv_ctx_cpp = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
+    require(srv_ctx_cpp, "prompt_cache.can_admit", "server-context.cpp missing prompt_save pre-copy admission check")
+    require(srv_ctx_cpp, "try_clear_idle_slots(ret->id)", "server-context.cpp missing unified-KV prompt_load idle-slot retry")
+
 
 if __name__ == "__main__":
     main()

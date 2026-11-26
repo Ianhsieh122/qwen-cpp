@@ -1003,6 +1003,7 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+    uint64_t n_reallocs;
 };
 
 // note: this inserts the tensor into the hash set, so the scheduler can no longer be
@@ -1877,6 +1878,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        sched->n_reallocs++;
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -2430,6 +2432,11 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+uint64_t ggml_backend_sched_get_n_reallocs(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_reallocs;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

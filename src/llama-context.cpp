@@ -2197,6 +2197,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const uint64_t reallocs_before = ggml_backend_sched_get_n_reallocs(sched.get());
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2204,6 +2205,55 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 mctx->graph_compute_finish(ret);
             }
             return nullptr;
+        }
+
+        // If a runtime topology transition forced a reallocation on a pipelined graph,
+        // ggml_gallocr_reserve_n() just shrank n_kv-dependent tensors' size_max (such as
+        // attn_inp_kq_mask) to this ubatch's small n_kv, which would otherwise trigger a
+        // forced backend sync on every subsequent ubatch as n_kv grows. Re-reserve this
+        // exact ubatch topology once against memory->init_full() to restore full-n_kv
+        // size_max while reusing the already-allocated compute buffers.
+        if (cparams.pipeline_parallel &&
+                memory != nullptr &&
+                mctx != nullptr &&
+                !model.hparams.no_alloc &&
+                gtype == ctx_type_to_graph_type(cparams.ctx_type) &&
+                (cparams.kv_unified || ubatch.n_seqs_unq == cparams.n_seq_max) &&
+                ggml_backend_sched_get_n_reallocs(sched.get()) != reallocs_before) {
+            const int orig_n_nodes = ggml_graph_n_nodes(gf);
+            auto mctx_full = memory->init_full();
+            if (mctx_full) {
+                auto * res_full = gf_res_reserve.get();
+                res_full->reset();
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+                const auto gparams_full = graph_params(res_full, ubatch, mctx_full.get(), gtype);
+                auto * gf_full = model.build_graph(gparams_full);
+                if (gf_full && ggml_graph_n_nodes(gf_full) == orig_n_nodes) {
+                    ggml_backend_sched_reserve(sched.get(), gf_full);
+                }
+
+                // Rebuild and allocate the live graph using the full-n_kv allocation table
+                // (or restore the live allocation if full-context reserve was skipped/failed).
+                res->reset();
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+                gf = model.build_graph(gparams);
+                if (!gf) {
+                    LLAMA_LOG_ERROR("%s: failed to rebuild graph after full-context reserve\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    mctx->graph_compute_finish(ret);
+                    return nullptr;
+                }
+                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate graph after full-context reserve\n", __func__);
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    mctx->graph_compute_finish(ret);
+                    return nullptr;
+                }
+            }
         }
 
         gf_res_prev_active = res;

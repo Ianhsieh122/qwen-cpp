@@ -610,5 +610,27 @@ int main() {
         assert(cache.accounted_size() == 230*KIB);
     }
 
+    {
+        server_prompt_cache cache(1, 0);
+        server_prompt current = make_prompt({10, 11, 12});
+        auto & ckpt = current.checkpoints.emplace_back();
+        ckpt.n_tokens = 3;
+        ckpt.data_tgt.resize(300*KIB);
+
+        size_t standalone = 0;
+        bool already_cached = false;
+        assert(!cache.can_admit(current, 800*KIB, &standalone, &already_cached));
+        assert(!already_cached);
+        assert(standalone == 1100*KIB);
+
+        assert(cache.can_admit(current, 500*KIB, &standalone, &already_cached));
+        assert(!already_cached);
+        assert(standalone == 800*KIB);
+
+        assert(cache.alloc(current, 500*KIB, 0) != nullptr);
+        assert(!cache.can_admit(current, 500*KIB, &standalone, &already_cached));
+        assert(already_cached);
+    }
+
     return 0;
 }
