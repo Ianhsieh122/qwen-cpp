@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
