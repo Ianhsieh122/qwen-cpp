@@ -59,6 +59,10 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool                embeddings_layer_inp_fp16      = false;   // extract t_layer_inp in F16 to halve PCIe D2H bandwidth
+    uint32_t            embeddings_layer_inp_tail      = 0;       // if > 0, only D2H transfer last N tokens of single-seq monotonic batches (SWA-only drafts)
+    const ggml_fp16_t * embeddings_dflash_inp_f16      = nullptr; // optional external F16 target features for DFlash KV injection
+    int64_t             embeddings_dflash_inp_f16_rows = 0;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

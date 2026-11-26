@@ -188,7 +188,14 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         if (il > 0) {
             inpL = maybe_compress_boundary(inpL, model.dev_layer(il - 1), model.dev_layer(il), il - 1, il);
         }
-        res->t_layer_inp[il] = inpL;
+        if (il < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il] && cparams.embeddings_layer_inp_fp16) {
+            ggml_tensor * layer_inp_f16 = ggml_cast(ctx0, inpL, GGML_TYPE_F16);
+            cb(layer_inp_f16, "layer_inp_f16", il);
+            ggml_build_forward_expand(gf, layer_inp_f16);
+            res->t_layer_inp[il] = layer_inp_f16;
+        } else {
+            res->t_layer_inp[il] = inpL;
+        }
 
         ggml_tensor * inpSA = inpL;
 

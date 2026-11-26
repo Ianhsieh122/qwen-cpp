@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -377,6 +378,14 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+static int ggml_cuda_volta_mmvq_max_batch() {
+    static const int val = []() {
+        const char * env = std::getenv("GGML_CUDA_VOLTA_MMVQ_MAX_BATCH");
+        return (env != nullptr && env[0] != '\0') ? std::atoi(env) : 0;
+    }();
+    return val;
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -433,6 +442,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         }
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
+        const int env_max = ggml_cuda_volta_mmvq_max_batch();
+        if (env_max > 0) {
+            return ne11 <= std::min(env_max, MMVQ_MAX_BATCH_SIZE);
+        }
         switch (type) {
             case GGML_TYPE_Q2_K:
                 return ne11 <= 4;
@@ -1054,7 +1067,7 @@ static __global__ void mul_mat_vec_q(
             }
         } else
 #endif
-        if constexpr (type == GGML_TYPE_Q4_K && vdr == 2 && ncols_dst > 1 && ncols_dst <= 4) {
+        if constexpr (type == GGML_TYPE_Q4_K && vdr == 2 && ncols_dst > 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const int kbx_i = kbx_row_offsets[i] + kbx;
@@ -1070,7 +1083,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-        } else if constexpr (type == GGML_TYPE_Q6_K && vdr == 1 && ncols_dst > 1 && ncols_dst <= 4) {
+        } else if constexpr (type == GGML_TYPE_Q6_K && vdr == 1 && ncols_dst > 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const int kbx_i = kbx_row_offsets[i] + kbx;
@@ -1086,7 +1099,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-        } else if constexpr (type == GGML_TYPE_Q5_K && vdr == 2 && ncols_dst > 1 && ncols_dst <= 4) {
+        } else if constexpr (type == GGML_TYPE_Q5_K && vdr == 2 && ncols_dst > 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const int kbx_i = kbx_row_offsets[i] + kbx;
@@ -1102,7 +1115,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-        } else if constexpr (type == GGML_TYPE_IQ4_XS && vdr == 4 && ncols_dst > 1 && ncols_dst <= 4) {
+        } else if constexpr (type == GGML_TYPE_IQ4_XS && vdr == 4 && ncols_dst > 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const int kbx_i = kbx_row_offsets[i] + kbx;
@@ -1412,7 +1425,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst >= 1 && c_ncols_dst <= 4) {
+    if constexpr (c_ncols_dst >= 1 && c_ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -1423,7 +1436,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=4");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=MMVQ_MAX_BATCH_SIZE");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
@@ -1898,7 +1911,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || (dst->ne[1] >= 1 && dst->ne[1] <= 4));
+        GGML_ASSERT(  ids || (dst->ne[1] >= 1 && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);

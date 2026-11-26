@@ -137,6 +137,17 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Enable/query FP16 extraction and SWA tail-window transfer for target layer inputs,
+// plus external F16 target-feature injection for DFlash drafts.
+LLAMA_API void          llama_set_embeddings_layer_inp_fp16(struct llama_context * ctx, bool value);
+LLAMA_API bool          llama_get_embeddings_layer_inp_fp16_enabled(const struct llama_context * ctx);
+LLAMA_API ggml_fp16_t * llama_get_embeddings_layer_inp_f16(struct llama_context * ctx, uint32_t lid);
+LLAMA_API void          llama_set_embeddings_layer_inp_tail(struct llama_context * ctx, uint32_t n_tail);
+LLAMA_API void          llama_set_embeddings_dflash_inp_f16(struct llama_context * ctx, const ggml_fp16_t * data, int64_t n_rows);
+
+// Returns n_swa when every attention layer uses standard sliding-window attention, else 0.
+LLAMA_API uint32_t      llama_model_swa_all_window(const struct llama_model * model);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

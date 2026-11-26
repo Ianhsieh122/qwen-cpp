@@ -618,13 +618,14 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    const bool use_f16_inp = (cparams.embeddings_dflash_inp_f16 != nullptr && ubatch.embd == nullptr);
+    if (ubatch.embd || use_f16_inp) {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp, &cparams);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+        inp->embd = ggml_new_tensor_2d(ctx0, use_f16_inp ? GGML_TYPE_F16 : GGML_TYPE_F32, n_embd_inp, n_tokens);
         ggml_set_input(inp->embd);
 
-        ggml_tensor * inp_target = inp->embd;
+        ggml_tensor * inp_target = use_f16_inp ? ggml_cast(ctx0, inp->embd, GGML_TYPE_F32) : inp->embd;
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));

@@ -134,13 +134,48 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (ubatch->token && tokens) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
-    if (ubatch->embd && embd && !ubatch->is_mixed()) {
+    if (embd && embd->type == GGML_TYPE_F16 && cparams && cparams->embeddings_dflash_inp_f16 && !ubatch->is_mixed()) {
+        GGML_ASSERT(n_embd == embd->ne[0]);
+
+        const int64_t n_tokens = ubatch->n_tokens;
+        const ggml_fp16_t * src_f16  = cparams->embeddings_dflash_inp_f16;
+        const int64_t       src_rows = cparams->embeddings_dflash_inp_f16_rows;
+
+        if (ubatch->data && ubatch->data->batch_idxs.size() == (size_t) n_tokens) {
+            const auto & batch_idxs = ubatch->data->batch_idxs;
+            bool contiguous = true;
+            const int32_t base_idx = batch_idxs[0];
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                if (batch_idxs[i] != base_idx + i) {
+                    contiguous = false;
+                    break;
+                }
+            }
+            if (contiguous) {
+                GGML_ASSERT(base_idx >= 0 && base_idx + n_tokens <= src_rows);
+                ggml_backend_tensor_set(embd, src_f16 + (size_t) base_idx * n_embd, 0, n_tokens * n_embd * sizeof(ggml_fp16_t));
+            } else {
+                std::vector<ggml_fp16_t> gathered((size_t) n_tokens * n_embd);
+                for (int64_t i = 0; i < n_tokens; ++i) {
+                    const int32_t bi = batch_idxs[i];
+                    GGML_ASSERT(bi >= 0 && bi < src_rows);
+                    std::memcpy(gathered.data() + (size_t) i * n_embd,
+                                src_f16 + (size_t) bi * n_embd,
+                                (size_t) n_embd * sizeof(ggml_fp16_t));
+                }
+                ggml_backend_tensor_set(embd, gathered.data(), 0, gathered.size() * sizeof(ggml_fp16_t));
+            }
+        } else {
+            GGML_ASSERT(n_tokens <= src_rows);
+            ggml_backend_tensor_set(embd, src_f16, 0, n_tokens * n_embd * sizeof(ggml_fp16_t));
+        }
+    } else if (ubatch->embd && embd && !ubatch->is_mixed()) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -194,8 +229,11 @@ static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    const bool want_dflash_f16 = (params.cparams.embeddings_dflash_inp_f16 != nullptr && params.ubatch.embd == nullptr);
+
+    res &= (!params.ubatch.token || want_dflash_f16) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !want_dflash_f16) || (embd && embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!embd) || (embd->type == (want_dflash_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32));
     res &= (!mixed_tokens) || mixed_tokens->ne[0] == llm_graph_n_tok_rows(params.ubatch);
     res &= (!mixed_embd)   || mixed_embd->ne[1]   == params.ubatch.n_tokens;
     res &= (!scale_rows) || scale_rows->ne[1] == params.ubatch.n_tokens;

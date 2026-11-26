@@ -719,6 +719,29 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (peer_copy_stream != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(peer_copy_stream));
+        CUDA_CHECK(cudaStreamDestroy(peer_copy_stream));
+        peer_copy_stream = nullptr;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (peer_stage_ready[i] != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(peer_stage_ready[i]));
+            peer_stage_ready[i] = nullptr;
+        }
+        if (peer_stage_done[i] != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(peer_stage_done[i]));
+            peer_stage_done[i] = nullptr;
+        }
+        if (peer_stage_buf[i] != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(peer_stage_buf[i]));
+            peer_stage_buf[i] = nullptr;
+            peer_stage_size[i] = 0;
+        }
+        peer_stage_done_recorded[i] = false;
+    }
     for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
         if (cublas_src1_f16_cache[s].dev_buf != nullptr) {
             ggml_cuda_set_device(device);
@@ -1921,8 +1944,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we support fusion for ncols_dst = 1..4 when MMVQ is selected
-    if (tensor->op == GGML_OP_MUL_MAT && (dst->ne[1] < 1 || dst->ne[1] > 4 ||
+    //we support fusion for ncols_dst = 1..MMVQ_MAX_BATCH_SIZE when MMVQ is selected
+    if (tensor->op == GGML_OP_MUL_MAT && (dst->ne[1] < 1 || dst->ne[1] > MMVQ_MAX_BATCH_SIZE ||
             (dst->ne[1] > 1 && !ggml_cuda_should_use_mmvq(src0->type, cc, dst->ne[1])))) {
         return false;
     }
@@ -2682,6 +2705,17 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// Slow-PCIe peer copies are staged through a double-buffered HBM2 snapshot so that
+// the source buffer can be reused by src-device compute immediately. Disable with
+// GGML_CUDA_ASYNC_PEER_STAGE=0.
+static bool ggml_cuda_async_peer_stage_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_CUDA_ASYNC_PEER_STAGE");
+        return env == nullptr || std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2720,7 +2754,63 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            const size_t nbytes = ggml_nbytes(dst);
+
+            if (ggml_cuda_async_peer_stage_enabled() && nbytes >= 256 * 1024 && nbytes <= 64 * 1024 * 1024) {
+                cudaStreamCaptureStatus cap_src = cudaStreamCaptureStatusNone;
+                cudaStreamCaptureStatus cap_dst = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(cuda_ctx_src->stream(), &cap_src) == cudaSuccess &&
+                    cudaStreamIsCapturing(cuda_ctx_dst->stream(), &cap_dst) == cudaSuccess &&
+                    cap_src == cudaStreamCaptureStatusNone &&
+                    cap_dst == cudaStreamCaptureStatusNone) {
+                    ggml_cuda_set_device(cuda_ctx_src->device);
+
+                    if (cuda_ctx_src->peer_copy_stream == nullptr) {
+                        CUDA_CHECK(cudaStreamCreateWithFlags(&cuda_ctx_src->peer_copy_stream, cudaStreamNonBlocking));
+                    }
+
+                    const int slot = cuda_ctx_src->peer_stage_idx;
+                    cuda_ctx_src->peer_stage_idx ^= 1;
+
+                    if (cuda_ctx_src->peer_stage_ready[slot] == nullptr) {
+                        CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->peer_stage_ready[slot], cudaEventDisableTiming));
+                    }
+                    if (cuda_ctx_src->peer_stage_done[slot] == nullptr) {
+                        CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->peer_stage_done[slot], cudaEventDisableTiming));
+                    }
+
+                    if (cuda_ctx_src->peer_stage_size[slot] < nbytes) {
+                        // the previous copy through this slot must be finished before the buffer is released
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx_src->peer_copy_stream));
+                        if (cuda_ctx_src->peer_stage_buf[slot] != nullptr) {
+                            CUDA_CHECK(cudaFree(cuda_ctx_src->peer_stage_buf[slot]));
+                            cuda_ctx_src->peer_stage_buf[slot] = nullptr;
+                        }
+                        CUDA_CHECK(cudaMalloc(&cuda_ctx_src->peer_stage_buf[slot], nbytes));
+                        cuda_ctx_src->peer_stage_size[slot] = nbytes;
+                        cuda_ctx_src->peer_stage_done_recorded[slot] = false;
+                    }
+
+                    if (cuda_ctx_src->peer_stage_done_recorded[slot]) {
+                        // do not overwrite the staging buffer while the peer copy still reads it
+                        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_src->peer_stage_done[slot], 0));
+                    }
+
+                    // fast on-device HBM2 snapshot so that src->data can be overwritten immediately
+                    CUDA_CHECK(cudaMemcpyAsync(cuda_ctx_src->peer_stage_buf[slot], src->data, nbytes,
+                        cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+                    CUDA_CHECK(cudaEventRecord(cuda_ctx_src->peer_stage_ready[slot], cuda_ctx_src->stream()));
+                    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->peer_copy_stream, cuda_ctx_src->peer_stage_ready[slot], 0));
+                    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, cuda_ctx_src->peer_stage_buf[slot], src_physical, nbytes,
+                        cuda_ctx_src->peer_copy_stream));
+                    CUDA_CHECK(cudaEventRecord(cuda_ctx_src->peer_stage_done[slot], cuda_ctx_src->peer_copy_stream));
+                    cuda_ctx_src->peer_stage_done_recorded[slot] = true;
+                    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->peer_stage_done[slot], 0));
+                    return true;
+                }
+            }
+
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, nbytes, cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -2745,6 +2835,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    if (cuda_ctx->peer_copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->peer_copy_stream));
+    }
 
     GGML_UNUSED(backend);
 }

@@ -173,7 +173,7 @@ def main() -> None:
     # v0.1.1: P0 + P1 Qwen 3.8 27B PP/TG/long-context optimizations
     require(qwen35, "t->ne[1] < 16", "qwen35.cpp must gate split_act_type on n_tokens >= 16")
     require(convert, "dequant_iq4nl_pair_f16_volta", "convert.cu missing Volta IQ4_XS prmt F16 unpacker")
-    require(fattn_vec, "use_q8_dot", "fattn-vec.cuh missing dp4a Q-quantized GQA-6 dot path")
+    require(fattn_vec, "half2  Q_reg[GQA][h2_per_lane]", "fattn-vec.cuh missing Volta half2 Q_reg GQA decode path")
     require(fattn_vec, "exp2f", "fattn-vec.cuh missing exp2f log2-space softmax")
     require(mmvq, "vec_dot_q5_K_q8_1_multi_vdr2", "mmvq.cu missing multi-col Q5_K unpack-once kernel")
     require(mmvq, "vec_dot_iq4_xs_q8_1_multi_vdr4", "mmvq.cu missing multi-col IQ4_XS unpack-once kernel")
@@ -186,6 +186,17 @@ def main() -> None:
     require(ggml_h, "GGML_CAUSAL_MASK_MAGIC", "ggml.h missing GGML_CAUSAL_MASK_MAGIC")
     require(kv_cache_cpp, "GGML_CAUSAL_MASK_MAGIC", "llama-kv-cache.cpp missing deferred causal mask path")
     require(backend_cpp, "GGML_CAUSAL_MASK_MAGIC", "ggml-backend.cpp missing GPU causal mask dispatch")
+
+    # DFlash2 slow-PCIe + async dual-GPU peer stage + Volta MMVQ ncols<=8
+    require(cuda_cu, "GGML_CUDA_ASYNC_PEER_STAGE", "ggml-cuda.cu missing GGML_CUDA_ASYNC_PEER_STAGE")
+    require(cuda_cu, "peer_copy_stream", "ggml-cuda.cu missing async peer_copy_stream")
+    require(mmvq, "GGML_CUDA_VOLTA_MMVQ_MAX_BATCH", "mmvq.cu missing GGML_CUDA_VOLTA_MMVQ_MAX_BATCH")
+    require(ctx_cpp, "embeddings_layer_inp_fp16", "llama-context.cpp missing embeddings_layer_inp_fp16")
+    require(ctx_cpp, "embeddings_layer_inp_tail", "llama-context.cpp missing embeddings_layer_inp_tail")
+    require(spec_cpp, "LLAMA_LAYER_INP_FP16", "speculative.cpp missing LLAMA_LAYER_INP_FP16")
+    require(spec_cpp, "LLAMA_DFLASH_SWA_SKIP", "speculative.cpp missing LLAMA_DFLASH_SWA_SKIP")
+    dflash_cpp = (ROOT / "src/models/dflash.cpp").read_text(encoding="utf-8")
+    require(dflash_cpp, "embeddings_dflash_inp_f16", "dflash.cpp missing embeddings_dflash_inp_f16")
 
 
 if __name__ == "__main__":

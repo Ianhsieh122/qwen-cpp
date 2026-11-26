@@ -1544,6 +1544,16 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Dedicated non-blocking async peer copy stream with 2-slot double-buffered
+    // HBM2 staging, used for slow-PCIe multi-GPU tensor copies.
+    cudaStream_t peer_copy_stream = nullptr;
+    void *       peer_stage_buf[2] = { nullptr, nullptr };
+    size_t       peer_stage_size[2] = { 0, 0 };
+    cudaEvent_t  peer_stage_ready[2] = { nullptr, nullptr };
+    cudaEvent_t  peer_stage_done[2]  = { nullptr, nullptr };
+    bool         peer_stage_done_recorded[2] = { false, false };
+    int          peer_stage_idx = 0;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

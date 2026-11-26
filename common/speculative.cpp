@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1015,7 +1016,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_batch batch;        // noise tokens
     common_batch batch_inject; // target features for KV cache injection
 
-    std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
+    std::vector<float>       features_buf;     // [n_chunk, n_embd_enc] gathered target features
+    std::vector<ggml_fp16_t> features_buf_f16; // [n_chunk, n_embd_enc] gathered FP16 target features
+
+    bool     use_layer_inp_f16 = false;
+    uint32_t dflash_swa_tail   = 0;
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1159,6 +1164,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
+        {
+            const char * env_fp16 = std::getenv("LLAMA_LAYER_INP_FP16");
+            const bool want_fp16 = (env_fp16 == nullptr) || (std::strcmp(env_fp16, "0") != 0);
+            llama_set_embeddings_layer_inp_fp16(ctx_tgt, want_fp16);
+            use_layer_inp_f16 = llama_get_embeddings_layer_inp_fp16_enabled(ctx_tgt);
+
+            const char * env_swa_skip = std::getenv("LLAMA_DFLASH_SWA_SKIP");
+            const bool allow_swa_skip = (env_swa_skip == nullptr) || (std::strcmp(env_swa_skip, "0") != 0);
+            dflash_swa_tail = allow_swa_skip ? llama_model_swa_all_window(model_dft) : 0;
+            if (dflash_swa_tail > 0) {
+                llama_set_embeddings_layer_inp_tail(ctx_tgt, dflash_swa_tail);
+            }
+            LOG_INF("%s: - layer_inp_fp16=%s, swa_skip_tail=%u\n", __func__,
+                    use_layer_inp_f16 ? "true" : "false", dflash_swa_tail);
+        }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
@@ -1246,8 +1266,58 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            // When all draft layers use standard SWA (window W) and positions are monotonic,
+            // only the trailing W tokens can remain unmasked for subsequent draft steps.
+            int32_t offset_start = 0;
+            if (dflash_swa_tail > 0 && n_rows > (int32_t) dflash_swa_tail) {
+                const llama_pos p0 = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
+                bool monotonic = true;
+                for (int32_t r = 0; r < n_rows; ++r) {
+                    if (batch_in.tokens[i_batch_beg[seq_id] + r].pos[0] != p0 + r) {
+                        monotonic = false;
+                        break;
+                    }
+                }
+                if (monotonic) {
+                    offset_start = n_rows - (int32_t) dflash_swa_tail;
+                }
+            }
+
+            for (int32_t offset = offset_start; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+                if (use_layer_inp_f16) {
+                    features_buf_f16.resize((size_t) n_chunk * n_embd_enc);
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const ggml_fp16_t * layer = llama_get_embeddings_layer_inp_f16(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input f16 not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            ggml_fp16_t       * dst = features_buf_f16.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const ggml_fp16_t * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(ggml_fp16_t));
+                        }
+                    }
+
+                    batch_inject.clear();
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                        const int32_t bidx = batch_inject.add(0, p, seq_id, false);
+                        if (is_mrope) {
+                            batch_inject.tokens[bidx].pos = { p, p, p, 0 };
+                        }
+                    }
+                    llama_set_embeddings_dflash_inp_f16(ctx_dft, features_buf_f16.data(), n_chunk);
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                    llama_set_embeddings_dflash_inp_f16(ctx_dft, nullptr, 0);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_process(ctx_dft) f16 failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    continue;
+                }
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions

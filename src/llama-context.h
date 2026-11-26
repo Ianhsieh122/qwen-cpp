@@ -95,7 +95,9 @@ struct llama_context {
     ggml_fp16_t * get_embeddings_nextn_f16_ith(int32_t i);
     bool          get_embeddings_nextn_fp16_enabled() const;
 
-    float * get_embeddings_layer_inp(uint32_t lid);
+    float *       get_embeddings_layer_inp(uint32_t lid);
+    ggml_fp16_t * get_embeddings_layer_inp_f16(uint32_t lid);
+    bool          get_embeddings_layer_inp_fp16_enabled() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -126,6 +128,9 @@ struct llama_context {
     void set_embeddings_nextn_fp16(bool value);
     void set_embeddings_nextn_inp_f16(const ggml_fp16_t * data, int64_t n_rows);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_fp16(bool value);
+    void set_embeddings_layer_inp_tail(uint32_t n_tail);
+    void set_embeddings_dflash_inp_f16(const ggml_fp16_t * data, int64_t n_rows);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -249,7 +254,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    bool extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset, uint32_t n_tokens_all, bool tail_eligible);
 
     // ensure an on-device staging buffer exists for multi-ubatch h_nextn extraction
     bool h_nextn_dev_alloc(ggml_backend_dev_t dev, ggml_type type, uint32_t n_embd, uint32_t n_rows);
@@ -326,7 +331,8 @@ private:
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
-    std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<buffer_view<float>>       embd_layer_inp;
+    std::vector<buffer_view<ggml_fp16_t>> embd_layer_inp_f16;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {
