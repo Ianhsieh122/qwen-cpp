@@ -1540,13 +1540,17 @@ static __global__ void flash_attn_combine_results(
     float VKQ_denominator = 0.0f;
     constexpr float LOG2E = 1.4426950408889634f;
     for (int l = 0; l < parallel_blocks; ++l) {
+        const float l_sum = meta[l].y;
+        if (l_sum == 0.0f) {
+            continue;
+        }
         const float KQ_max_scale = exp2f((meta[l].x - kqmax) * LOG2E);
 
-        VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
-        VKQ_denominator += KQ_max_scale * meta[l].y;
+        VKQ_numerator   = fmaf(KQ_max_scale, VKQ_parts[l*D + tid], VKQ_numerator);
+        VKQ_denominator = fmaf(KQ_max_scale, l_sum, VKQ_denominator);
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f;
     if (tid == 0 && dst_meta != nullptr) {
         dst_meta[j_dst_unrolled] = make_float2(kqmax, VKQ_denominator);
     }

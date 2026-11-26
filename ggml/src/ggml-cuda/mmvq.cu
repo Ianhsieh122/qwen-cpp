@@ -141,7 +141,7 @@ enum mmvq_parameter_table_id {
 // thread than the 2 rows of K-loop work a single row provides, so decode walks several
 // output rows at once and lets the loads interleave.
 #ifndef BEE_MMVQ_VOLTA_ROWS
-#define BEE_MMVQ_VOLTA_ROWS 1
+#define BEE_MMVQ_VOLTA_ROWS 2
 #endif
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -895,6 +895,54 @@ static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi_vdr4(
     }
 }
 
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q8_0_q8_1_multi_vdr2(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs, const uint32_t stride_col_y, float * __restrict__ dots) {
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+    const int v0 = get_int_b2(bq8_0->qs, iqs + 0);
+    const int v1 = get_int_b2(bq8_0->qs, iqs + 1);
+    const float d8_0 = __half2float(bq8_0->d);
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const block_q8_1 * bq8_c = bq8_1 + c * stride_col_y;
+        const int u0 = get_int_b4(bq8_c->qs, iqs + 0);
+        const int u1 = get_int_b4(bq8_c->qs, iqs + 1);
+        const int sumi = ggml_cuda_dp4a(v1, u1, ggml_cuda_dp4a(v0, u0, 0));
+        dots[c] = (d8_0 * __low2float(bq8_c->ds)) * (float) sumi;
+    }
+}
+
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q4_0_q8_1_multi_vdr2(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs, const uint32_t stride_col_y, float * __restrict__ dots) {
+    const block_q4_0 * bq4_0 = (const block_q4_0 *) vbq + kbx;
+    const int v0 = get_int_b2(bq4_0->qs, iqs + 0);
+    const int v1 = get_int_b2(bq4_0->qs, iqs + 1);
+    const int v0_lo = (v0 >> 0) & 0x0F0F0F0F;
+    const int v0_hi = (v0 >> 4) & 0x0F0F0F0F;
+    const int v1_lo = (v1 >> 0) & 0x0F0F0F0F;
+    const int v1_hi = (v1 >> 4) & 0x0F0F0F0F;
+    const float d4 = __half2float(bq4_0->d);
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        const block_q8_1 * bq8_c = bq8_1 + c * stride_col_y;
+        const int u00 = get_int_b4(bq8_c->qs, iqs + 0);
+        const int u01 = get_int_b4(bq8_c->qs, iqs + 0 + QI4_0);
+        const int u10 = get_int_b4(bq8_c->qs, iqs + 1);
+        const int u11 = get_int_b4(bq8_c->qs, iqs + 1 + QI4_0);
+        int sumi = ggml_cuda_dp4a(v0_lo, u00, 0);
+        sumi = ggml_cuda_dp4a(v0_hi, u01, sumi);
+        sumi = ggml_cuda_dp4a(v1_lo, u10, sumi);
+        sumi = ggml_cuda_dp4a(v1_hi, u11, sumi);
+        const float2 ds8f = __half22float2(bq8_c->ds);
+        dots[c] = d4 * (sumi * ds8f.x - (8 * 2 / QI4_0) * ds8f.y);
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -1126,6 +1174,38 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         vec_dot_iq4_xs_q8_1_multi_vdr4<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
+                    }
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q8_0 && vdr == 2 && ncols_dst > 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int kbx_i = kbx_row_offsets[i] + kbx;
+                float dots[ncols_dst];
+                vec_dot_q8_0_q8_1_multi_vdr2<ncols_dst>(vx, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_q8_0_q8_1_multi_vdr2<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
+                    }
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q4_0 && vdr == 2 && ncols_dst > 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int kbx_i = kbx_row_offsets[i] + kbx;
+                float dots[ncols_dst];
+                vec_dot_q4_0_q8_1_multi_vdr2<ncols_dst>(vx, &y[kby], kbx_i, kqs, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) tmp[j][i] += dots[j];
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        vec_dot_q4_0_q8_1_multi_vdr2<ncols_dst>(vgate, &y[kby], kbx_i, kqs, stride_col_y, dots);
 #pragma unroll
                         for (int j = 0; j < ncols_dst; ++j) tmp_gate[j][i] += dots[j];
                     }

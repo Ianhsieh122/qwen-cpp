@@ -553,27 +553,65 @@ static __device__ __forceinline__ void flash_attn_vec_gqa_load_row(
         static_assert(elems_per_lane == 8, "Q8_0 GQA loader expects 8 elements per lane");
         const block_q8_0 * blk = (const block_q8_0 *) row_ptr + (lane >> 2);
         const int iqs = (lane & 3) * 8;
+        const float d = __half2float(blk->d);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && !defined(GGML_USE_HIP)
+        uint2 raw;
+        ggml_cuda_memcpy_1<8, 2>(&raw, blk->qs + iqs);
+        const unsigned bias_bits = 0x64806480u; // 1152.0h packed in half2
+        const half2 bias2 = *reinterpret_cast<const half2 *>(&bias_bits);
+        const unsigned lo = raw.x ^ 0x80808080u;
+        const unsigned hi = raw.y ^ 0x80808080u;
+        unsigned h[4];
+        h[0] = __byte_perm(lo, 0x64646464u, 0x5150);
+        h[1] = __byte_perm(lo, 0x64646464u, 0x5352);
+        h[2] = __byte_perm(hi, 0x64646464u, 0x5150);
+        h[3] = __byte_perm(hi, 0x64646464u, 0x5352);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 qf = __half22float2(__hsub2(*reinterpret_cast<const half2 *>(&h[i]), bias2));
+            out[i] = make_float2(d * qf.x, d * qf.y);
+        }
+#else
         __align__(8) int8_t qs[8];
         ggml_cuda_memcpy_1<8, 2>(qs, blk->qs + iqs);
-        const float d = __half2float(blk->d);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             out[i] = make_float2(d * (float) qs[2 * i + 0], d * (float) qs[2 * i + 1]);
         }
+#endif
     } else if constexpr (type_KV == GGML_TYPE_Q4_0) {
         static_assert(elems_per_lane == 8, "Q4_0 GQA loader expects 8 elements per lane");
         const block_q4_0 * blk = (const block_q4_0 *) row_ptr + (lane >> 2);
         const int iqs   = (lane & 1) * 8;
         const int shift = ((lane >> 1) & 1) * 4;
+        const float d = __half2float(blk->d);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && !defined(GGML_USE_HIP)
+        uint2 raw;
+        ggml_cuda_memcpy_1<8, 2>(&raw, blk->qs + iqs);
+        const unsigned bias_bits = 0x64086408u; // 1032.0h packed in half2 (1024 + 8)
+        const half2 bias2 = *reinterpret_cast<const half2 *>(&bias_bits);
+        const unsigned lo = (raw.x >> shift) & 0x0F0F0F0Fu;
+        const unsigned hi = (raw.y >> shift) & 0x0F0F0F0Fu;
+        unsigned h[4];
+        h[0] = __byte_perm(lo, 0x64646464u, 0x5150);
+        h[1] = __byte_perm(lo, 0x64646464u, 0x5352);
+        h[2] = __byte_perm(hi, 0x64646464u, 0x5150);
+        h[3] = __byte_perm(hi, 0x64646464u, 0x5352);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 qf = __half22float2(__hsub2(*reinterpret_cast<const half2 *>(&h[i]), bias2));
+            out[i] = make_float2(d * qf.x, d * qf.y);
+        }
+#else
         __align__(8) uint8_t qs[8];
         ggml_cuda_memcpy_1<8, 2>(qs, blk->qs + iqs);
-        const float d = __half2float(blk->d);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int q0 = ((qs[2 * i + 0] >> shift) & 0x0F) - 8;
             const int q1 = ((qs[2 * i + 1] >> shift) & 0x0F) - 8;
             out[i] = make_float2(d * (float) q0, d * (float) q1);
         }
+#endif
     } else {
         static_assert(type_KV == GGML_TYPE_F16, "unsupported KV type for flash_attn_vec_gqa_load_row");
     }

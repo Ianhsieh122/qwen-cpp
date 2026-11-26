@@ -1610,7 +1610,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 c.reserve((size_t) (this->params.n_max + 1) * n_embd);
             }
         }
-        this->n_max = this->params.n_max;
+        this->n_max = this->params.mtp_context_lookup
+            ? std::max<int32_t>(this->params.n_max, 12)
+            : this->params.n_max;
+
+        if (this->params.n_window > 0 || this->params.mtp_defer_prompt || this->params.mtp_context_lookup) {
+            SPC_INF("draft-mtp opts: n_window=%d, defer_prompt=%s, context_lookup=%s (max_draft=%d)\n",
+                    this->params.n_window,
+                    this->params.mtp_defer_prompt ? "true" : "false",
+                    this->params.mtp_context_lookup ? "true" : "false",
+                    this->n_max);
+        }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -1669,12 +1679,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
-        if (pos_max < N - 1 && !is_mem_shared) {
+        if (pos_max < N - 1 && !is_mem_shared && !params.mtp_defer_prompt) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
                     "(need_embd / output flag on every prompt position?). "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 1);
+        }
+    }
+
+    void trim_draft_window(llama_seq_id seq_id) {
+        if (params.n_window <= 0 || is_mem_shared) {
+            return;
+        }
+        auto * mem_dft = llama_get_memory(params.ctx_dft);
+        const llama_pos p_min = llama_memory_seq_pos_min(mem_dft, seq_id);
+        const llama_pos p_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+        if (p_min < 0 || p_max < p_min) {
+            return;
+        }
+        const int32_t slack = std::max<int32_t>(64, params.n_window / 4);
+        if ((p_max - p_min + 1) > params.n_window + slack) {
+            const llama_pos p_cut = p_max - params.n_window + 1;
+            llama_memory_seq_rm(mem_dft, seq_id, 0, p_cut);
         }
     }
 
@@ -1720,8 +1747,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         const ggml_fp16_t * h_tgt_f16 = llama_get_embeddings_nextn_f16(ctx_tgt);
 
-        // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        // if kv is shared with target (e.g Gemma4), or defer-prompt skips large prompt chunks, skip catch-up decode
+        const bool defer_prompt_chunk = params.mtp_defer_prompt && !is_mem_shared && n_tokens >= 32;
+        if (!is_mem_shared && !defer_prompt_chunk) {
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1831,6 +1859,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!ok) {
                 return false;
             }
+
+            if (params.n_window > 0) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_end[seq_id] >= 0) {
+                        trim_draft_window(seq_id);
+                    }
+                }
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1841,7 +1877,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // verify_h is only indexed by accept() up to n_accepted <= n_max (at most n_max + 1 rows);
             // capping to the trailing window avoids copying tens of MB during prompt prefill.
             const int32_t total_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            const int32_t keep_rows  = std::min<int32_t>(total_rows, std::max<int32_t>(1, this->params.n_max + 1));
+            const int32_t keep_rows  = std::min<int32_t>(total_rows, std::max<int32_t>(1, this->n_max + 1));
             const int32_t start_idx  = i_batch_end[seq_id] - keep_rows + 1;
 
             verify_h_rows[seq_id] = keep_rows;
@@ -2024,6 +2060,55 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
+            }
+
+            // Lossless MTP-gated context lookup: when the trailing suffix (+ id_last) matches an
+            // earlier span in the sequence AND the trained MTP head agrees on the first drafted token,
+            // extend the proposal from that continuation (fully verified by the target model).
+            if (params.mtp_context_lookup && !dp.result_q && dp.prompt != nullptr && !dp.result->empty()) {
+                const auto & prompt = *dp.prompt;
+                const size_t cur_len = prompt.size();
+                const int32_t max_ext = dp.n_max > 0 ? std::min<int32_t>(dp.n_max, this->n_max) : this->n_max;
+                if (max_ext > (int32_t) dp.result->size() && cur_len >= 8) {
+                    const llama_token mtp_first = (*dp.result)[0];
+                    const size_t search_floor = cur_len > 65536 ? (cur_len - 65536) : 0;
+                    const size_t needle_lens[2] = { 8, 4 };
+                    bool extended = false;
+                    for (size_t nl : needle_lens) {
+                        if (cur_len <= nl + 1) {
+                            continue;
+                        }
+                        const size_t prefix_start = cur_len - (nl - 1);
+                        const size_t j_max = cur_len - nl - 1;
+                        for (size_t j = j_max; j > search_floor; --j) {
+                            if (prompt[j + nl - 1] != dp.id_last) {
+                                continue;
+                            }
+                            if (prompt[j + nl] != mtp_first) {
+                                continue;
+                            }
+                            bool ok = true;
+                            for (size_t k = 0; k + 1 < nl; ++k) {
+                                if (prompt[j + k] != prompt[prefix_start + k]) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if (ok) {
+                                const size_t cont_start = j + nl;
+                                const size_t avail = std::min<size_t>((size_t) max_ext, cur_len - cont_start);
+                                if (avail > dp.result->size()) {
+                                    dp.result->assign(prompt.begin() + cont_start, prompt.begin() + cont_start + avail);
+                                }
+                                extended = true;
+                                break;
+                            }
+                        }
+                        if (extended) {
+                            break;
+                        }
+                    }
+                }
             }
 
             if (dp.result->size() < (size_t) params.n_min) {
@@ -2691,11 +2776,17 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
         switch (type) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                const int32_t mtp_max = spec->draft.mtp_context_lookup
+                    ? std::max<int32_t>(spec->draft.n_max, 12)
+                    : spec->draft.n_max;
+                n_max = std::max(n_max, std::max(0, mtp_max));
+                break;
+            }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
                 break;

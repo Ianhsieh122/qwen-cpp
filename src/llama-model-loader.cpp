@@ -9,9 +9,12 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
+#include <mutex>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -1095,6 +1098,47 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static bool is_volta_bf16_to_f16_buft(ggml_backend_buffer_type_t buft) {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_CUDA_VOLTA_BF16_TO_F16");
+        return env == nullptr || std::strcmp(env, "0") != 0;
+    }();
+    if (!enabled || !buft || ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    const char * name = ggml_backend_dev_name(dev);
+    const char * desc = ggml_backend_dev_description(dev);
+    if (!name || !desc || std::strncmp(name, "CUDA", 4) != 0) {
+        return false;
+    }
+    return std::strstr(desc, "V100") != nullptr ||
+           std::strstr(desc, "GV100") != nullptr ||
+           std::strstr(desc, "TITAN V") != nullptr;
+}
+
+static void convert_bf16_to_f16_clamped(const void * src_void, void * dst_void, size_t n_bytes) {
+    GGML_ASSERT(n_bytes % sizeof(uint16_t) == 0);
+    const size_t n = n_bytes / sizeof(uint16_t);
+    const auto * src = static_cast<const ggml_bf16_t *>(src_void);
+    auto * dst = static_cast<ggml_fp16_t *>(dst_void);
+    constexpr float f16_max = 65504.0f;
+    for (size_t i = 0; i < n; ++i) {
+        float v = ggml_bf16_to_fp32(src[i]);
+        if (std::isfinite(v)) {
+            if (v > f16_max) {
+                v = f16_max;
+            } else if (v < -f16_max) {
+                v = -f16_max;
+            }
+        }
+        dst[i] = ggml_fp32_to_fp16(v);
+    }
+}
+
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -1383,6 +1427,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    // Volta (sm_70) lacks native BF16 tensor cores; convert 2D+ BF16 weights to F16 on upload.
+    if (t_meta.type == GGML_TYPE_BF16 && ggml_n_dims(&t_meta) >= 2 && is_volta_bf16_to_f16_buft(buft)) {
+        t_meta.type = GGML_TYPE_F16;
+        static std::once_flag once_bf16_f16;
+        std::call_once(once_bf16_f16, [buft]() {
+            LLAMA_LOG_INFO("llama_model_loader: converting 2D+ BF16 weight tensors to F16 for Volta (%s); set GGML_CUDA_VOLTA_BF16_TO_F16=0 to disable\n",
+                    ggml_backend_buft_name(buft));
+        });
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1653,6 +1707,7 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+        const bool convert_bf16_to_f16 = (weight->tensor->type == GGML_TYPE_BF16 && cur->type == GGML_TYPE_F16);
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1665,13 +1720,15 @@ bool llama_model_loader::load_all_data(
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
-                validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
-                    return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
+                const ggml_type disk_type = weight->tensor->type;
+                validation_result.emplace_back(std::async(std::launch::async, [cur, disk_type, data, n_size] {
+                    return std::make_pair(cur, ggml_validate_row_data(disk_type, data, n_size));
                 }));
             }
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
+                GGML_ASSERT(!convert_bf16_to_f16);
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
@@ -1683,6 +1740,14 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (convert_bf16_to_f16) {
+                constexpr size_t chunk_bytes = 4 * 1024 * 1024;
+                std::vector<uint8_t> conv_buf(std::min(n_size, chunk_bytes));
+                for (size_t off = 0; off < n_size; off += chunk_bytes) {
+                    const size_t cur_bytes = std::min(chunk_bytes, n_size - off);
+                    convert_bf16_to_f16_clamped(data + off, conv_buf.data(), cur_bytes);
+                    ggml_backend_tensor_set(cur, conv_buf.data(), off, cur_bytes);
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1699,7 +1764,7 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (upload_backend && (!convert_bf16_to_f16 || (weight->offs % 2 == 0 && file->read_alignment() % 2 == 0))) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1740,6 +1805,11 @@ bool llama_model_loader::load_all_data(
                             data_to_copy -= (read_end - (offset + n_size));
                         }
 
+                        if (convert_bf16_to_f16) {
+                            convert_bf16_to_f16_clamped(reinterpret_cast<void *>(ptr_data),
+                                                        reinterpret_cast<void *>(ptr_data), data_to_copy);
+                        }
+
                         // Async upload actual data to GPU
                         ggml_backend_tensor_set_async(upload_backend, cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
@@ -1756,10 +1826,13 @@ bool llama_model_loader::load_all_data(
                     std::vector<no_init<uint8_t>> read_buf(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    if (check_tensors && !ggml_validate_row_data(weight->tensor->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
+                    if (convert_bf16_to_f16) {
+                        convert_bf16_to_f16_clamped(read_buf.data(), read_buf.data(), n_size);
+                    }
+                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                 }
             }
         }

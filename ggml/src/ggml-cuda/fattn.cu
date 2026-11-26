@@ -3,6 +3,7 @@
 #include "fattn-common.cuh"
 #include "fattn-kvarn-dispatch.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-sm70-small-t.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -1001,6 +1002,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
+    if (ggml_cuda_flash_attn_ext_sm70_small_t_supported(device, dst)) {
+        const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+            ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, false, false);
+        return f16_extra.end - (uintptr_t) dst->data;
+    }
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -1028,7 +1035,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 }
 
 static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const int device = ggml_cuda_get_device();
+    if (ggml_cuda_flash_attn_ext_sm70_small_t_supported(device, dst)) {
+        ggml_cuda_flash_attn_ext_sm70_small_t(ctx, dst);
+        return;
+    }
+    switch (ggml_cuda_get_best_fattn_kernel(device, dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

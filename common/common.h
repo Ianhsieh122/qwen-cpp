@@ -331,6 +331,7 @@ struct common_params_speculative_draft {
     int32_t n_max    = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min    = 0; // minimum number of draft tokens to use for speculative decoding
     int32_t n_ubatch = 0; // physical batch size (0 = auto: at least 128)
+    int32_t n_window = 0; // sliding KV window for owned draft context (0 = disabled)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -338,6 +339,9 @@ struct common_params_speculative_draft {
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
+
+    bool mtp_defer_prompt   = false; // skip prompt prefill on MTP draft context
+    bool mtp_context_lookup = false; // extend greedy MTP drafts with verified context-suffix matches
 
     common_params_model mparams;
 
@@ -442,7 +446,9 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        const bool has_mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+        const int32_t max_draft = (has_mtp && draft.mtp_context_lookup) ? std::max<int32_t>(draft.n_max, 12) : draft.n_max;
+        return needs_rs_seq ? max_draft : 0u;
     }
 };
 
