@@ -62,7 +62,7 @@ jobs:
     name: Build Linux CUDA 12.9 .zip (Ubuntu 24.04)
     needs: resolve-tag
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 360
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 2G
